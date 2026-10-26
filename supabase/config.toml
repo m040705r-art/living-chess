@@ -201,7 +201,19 @@ email_sent = 2
 # Number of SMS messages that can be sent per hour. Requires auth.sms to be enabled.
 sms_sent = 30
 # Number of anonymous sign-ins that can be made per hour per IP address. Requires enable_anonymous_sign_ins = true.
-anonymous_users = 10
+# SECURITY (red/blue finding, session_3): per-user throttles in the edge function are bypassable by minting
+# unlimited free anonymous accounts, because anonymous sign-in is unauthenticated and only loosely bound to IP.
+# The edge function rate-limits room creation per CLIENT IP (keyed on the un-spoofable socket peer, not the
+# client-supplied X-Forwarded-For — red/blue round 2 RED2-S6-XFF) and deletes stale rooms (migration
+# 20261026010000), and game_create enforces an IP/uid-INDEPENDENT global live-room cap (migration
+# 20261026020000) so storage/work are hard-bounded no matter how many accounts or forged IPs an attacker uses.
+# Those bound the damage, but the COMPLETE mitigation for the minting itself is at this auth layer and MUST be
+# set in production: lower anonymous_users to ~10/hour/IP AND enable the captcha below.
+# IMPORTANT (round 2 auth_email_minting): the captcha / low per-IP limit must cover ALL sign-up paths, not just
+# anonymous — sign_in_sign_ups below governs email/password signup, which also issues an instant session.
+# Both are left off here only because the unauthenticated test harness (flow.test.ts anon()) needs free,
+# un-captcha'd, high-volume anonymous sign-ups to run the attack simulations.
+anonymous_users = 5000   # LOCAL TESTING ONLY (attack simulations); PRODUCTION: ~10/hour/IP + captcha (see below)
 # Number of sessions that can be refreshed in a 5 minute interval per IP address.
 token_refresh = 150
 # Number of sign up and sign-in requests that can be made in a 5 minute interval per IP address (excludes anonymous users).
@@ -212,6 +224,9 @@ token_verifications = 30
 web3 = 30
 
 # Configure one of the supported captcha providers: `hcaptcha`, `turnstile`.
+# SECURITY (session_3): ENABLE this in production to stop free, scripted anonymous-account minting (the root of
+# the per-user rate-limit bypass). Left disabled locally only so the test harness can sign in without solving a
+# captcha. With it on, the client must pass a captcha token on /auth/v1/signup before any session is issued.
 # [auth.captcha]
 # enabled = true
 # provider = "hcaptcha"
@@ -224,6 +239,9 @@ enable_signup = true
 # addresses. If disabled, only the new email is required to confirm.
 double_confirm_changes = true
 # If enabled, users need to confirm their email address before signing in.
+# SECURITY (round 2 auth_email_minting): PRODUCTION should set this true (or require a captcha on signup) so
+# email/password signup cannot be used to mint instant sessions and sidestep the anonymous-signin limits.
+# Left false locally only so the test harness can create usable accounts without an SMTP round-trip.
 enable_confirmations = false
 # If enabled, users will need to reauthenticate or have logged in recently to change their password.
 secure_password_change = false

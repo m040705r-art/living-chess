@@ -41,6 +41,26 @@ const MAX_BODY = 512;
 const LIMITS: Record<string, [number, number]> = {   // action -> [max hits, per seconds]
   create: [5, 600], join: [20, 600], move: [90, 60], resign: [10, 600],
 };
+// Per-user limits alone are bypassable: anonymous sign-in is free and unbound to IP/device, so an outsider
+// mints unlimited fresh uids (each with an empty bucket) and multiplies every per-user limit. Room creation
+// is the resource-exhaustion vector (each room also writes a private.positions row), so it is ALSO capped
+// per CLIENT IP, as a short-window anti-burst limit. A real player opens at most a handful of rooms spaced
+// out, well under this; a concurrent flood from one IP is cut off regardless of how many accounts it uses.
+// (Production additionally wants a captcha on anonymous sign-in and a low per-IP anonymous_users limit — see
+// supabase/config.toml — which cannot be enabled on the local test stack without breaking the harness.)
+const IP_CREATE_MAX = 11, IP_CREATE_PER = 2;   // <= 11 creations per IP per 2s
+
+// client IP for the per-IP limiter. The leftmost X-Forwarded-For hop is CLIENT-CONTROLLED (an outsider
+// can forge a unique value per request and land each in its own empty bucket — see red-team RED2-S6-XFF),
+// so it is never trusted for rate limiting. We key on the socket peer (the platform edge gateway), which
+// the client cannot spoof. Behind a shared gateway this makes the per-IP create limit a global anti-burst
+// limit — fine for this game, and the hard guarantee against flooding is the GLOBAL waiting-room cap in
+// game_create (independent of IP and uid), which no amount of forged headers or minted accounts can exceed.
+function clientIp(_req: Request, info?: { remoteAddr?: Deno.Addr }): string {
+  const ra = info?.remoteAddr;
+  if (ra && "hostname" in ra && typeof ra.hostname === "string" && ra.hostname) return ra.hostname;
+  return "unknown";
+}
 
 function cors(origin: string | null): Record<string, string> {
   const h: Record<string, string> = {
@@ -71,7 +91,7 @@ function view(g: Record<string, unknown>, me: string) {
   };
 }
 
-Deno.serve(async (req) => {
+Deno.serve(async (req, info) => {
   const origin = req.headers.get("Origin");
   // a browser from anywhere else gets no CORS headers; non-browser callers still need a valid user token below
   if (origin && !ALLOWED.includes(origin)) return fail(null, 403, "origin");
@@ -103,13 +123,26 @@ Deno.serve(async (req) => {
   if (rlErr) return fail(origin, 500, "server");
   if (!ok) return fail(origin, 429, "slow_down");
 
+  // per-IP anti-burst limit on creation (not keyed on the uid, so minting accounts does not reset it)
+  if (action === "create") {
+    const { data: ipOk, error: ipErr } = await rpc("rate_hit_ip", {
+      p_ip: clientIp(req, info), p_action: "create", p_max: IP_CREATE_MAX, p_window_seconds: IP_CREATE_PER,
+    });
+    if (ipErr) return fail(origin, 500, "server");
+    if (!ipOk) return fail(origin, 429, "slow_down");
+  }
+
   try {
     if (action === "create") {
       const color = body.color === "random" || body.color === undefined ? (crypto.getRandomValues(new Uint8Array(1))[0] & 1 ? "white" : "black") : body.color;
       if (color !== "white" && color !== "black") return fail(origin, 400, "color");
       await rpc("game_housekeeping");
       const { data: g, error } = await rpc("game_create", { p_user: me, p_color: color, p_state: initial() });
-      if (error) return fail(origin, error.includes("too_many_rooms") ? 429 : 500, error.includes("too_many_rooms") ? "too_many_rooms" : "server");
+      if (error) {
+        if (error.includes("too_many_rooms")) return fail(origin, 429, "too_many_rooms");
+        if (error.includes("server_busy")) return fail(origin, 503, "server_busy");   // global room cap hit
+        return fail(origin, 500, "server");
+      }
       return reply(origin, 200, view(g, me));
     }
 
