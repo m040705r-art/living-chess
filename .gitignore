@@ -1,0 +1,44 @@
+# Unity generated
+/[Ll]ibrary/
+/[Tt]emp/
+/[Oo]bj/
+/[Bb]uild/
+/[Bb]uilds/
+/[Ll]ogs/
+/[Uu]ser[Ss]ettings/
+/[Mm]emoryCaptures/
+/[Rr]ecordings/
+*.csproj
+*.sln
+*.suo
+*.user
+*.pidb
+*.booproj
+*.unityproj
+*.tmp
+.vs/
+.vscode/
+.idea/
+crashlytics-build.properties
+
+# editor captures made while developing
+/Assets/Screenshots/
+/Assets/Screenshots.meta
+
+# Blender autosaves / backups
+*.blend1
+*.blend2
+
+# local tooling
+.playwright-cli/
+__pycache__/
+*.pyc
+
+# secrets never go in the repo (Supabase keys live in the dashboard / CI secrets)
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+supabase/.temp/
+supabase/.branches/

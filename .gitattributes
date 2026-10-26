@@ -1,0 +1,9 @@
+* text=auto eol=lf
+*.fbx binary
+*.glb binary
+*.blend binary
+*.wav binary
+*.png binary
+*.asset text eol=lf
+*.unity text eol=lf
+*.meta text eol=lf

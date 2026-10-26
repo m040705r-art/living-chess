@@ -1,0 +1,1096 @@
+<!doctype html>
+<html lang="ja">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Living Chess Preview</title>
+<style>
+  :root { --bg: #0b0a09; --fg: #efe6d4; --dim: #a89e8c; --accent: #d9b56a; --panel: rgba(18,15,12,.78); }
+  html, body { margin: 0; height: 100%; background: var(--bg); color: var(--fg); font-family: "Yu Gothic UI", "Hiragino Sans", sans-serif; overflow: hidden; }
+  canvas { display: block; }
+  #hud { position: fixed; left: 16px; top: 16px; background: var(--panel); border: 1px solid #3a3228; border-radius: 8px; padding: 12px 14px; max-width: 320px; }
+  #hud h1 { font-size: 16px; margin: 0 0 6px; color: var(--accent); letter-spacing: .05em; }
+  #status { font-size: 13px; color: var(--dim); min-height: 1.4em; }
+  #buttons { display: flex; flex-wrap: wrap; gap: 6px; margin-top: 10px; }
+  button { background: #2a231b; color: var(--fg); border: 1px solid #5a4a36; border-radius: 6px; padding: 5px 9px; font-size: 12px; cursor: pointer; }
+  button:hover { border-color: var(--accent); }
+  button.on { background: var(--accent); color: #1a140c; }
+</style>
+</head>
+<body>
+<div id="hud">
+  <h1>Living Chess</h1>
+  <div id="status">読み込み中…</div>
+  <div id="buttons"></div>
+</div>
+<script type="importmap">
+{ "imports": {
+  "three": "https://cdn.jsdelivr.net/npm/three@0.170.0/build/three.module.js",
+  "three/addons/": "https://cdn.jsdelivr.net/npm/three@0.170.0/examples/jsm/"
+} }
+</script>
+<script type="module">
+import * as THREE from 'three';
+import { GLTFLoader } from 'three/addons/loaders/GLTFLoader.js';
+import { OrbitControls } from 'three/addons/controls/OrbitControls.js';
+import * as SkeletonUtils from 'three/addons/utils/SkeletonUtils.js';
+import { RoomEnvironment } from 'three/addons/environments/RoomEnvironment.js';
+
+const renderer = new THREE.WebGLRenderer({ antialias: true });
+renderer.setPixelRatio(Math.min(devicePixelRatio, 1.5));
+renderer.setSize(innerWidth, innerHeight);
+renderer.shadowMap.enabled = true;
+renderer.shadowMap.type = THREE.PCFSoftShadowMap;
+renderer.toneMapping = THREE.ACESFilmicToneMapping;
+renderer.toneMappingExposure = 1.1;
+document.body.appendChild(renderer.domElement);
+
+const scene = new THREE.Scene();
+const pmrem = new THREE.PMREMGenerator(renderer);
+scene.environment = pmrem.fromScene(new RoomEnvironment(), 0.04).texture;
+scene.environmentIntensity = 0.35;
+
+// carved-stone look: object-space value noise -> mottling + faint veins, plus a little roughness variation
+function stoneify(mat, scale = 38, strength = 1) {
+  mat.userData.uCrumble = { value: 0 };   // 0 = intact, ~0.9 = fully eaten away (death)
+  mat.onBeforeCompile = sh => {
+    sh.uniforms.uStoneScale = { value: scale };
+    sh.uniforms.uStoneStrength = { value: strength };
+    sh.uniforms.uCrumble = mat.userData.uCrumble;
+    sh.vertexShader = sh.vertexShader
+      .replace('#include <common>', `#include <common>
+varying vec3 vStonePos;`)
+      .replace('#include <begin_vertex>', `#include <begin_vertex>
+vStonePos = position;`);
+    sh.fragmentShader = sh.fragmentShader
+      .replace('#include <common>', `#include <common>
+varying vec3 vStonePos; uniform float uStoneScale; uniform float uStoneStrength; uniform float uCrumble;
+float sh3(vec3 p){ p = fract(p * 0.3183099 + 0.1); p *= 17.0; return fract(p.x * p.y * p.z * (p.x + p.y + p.z)); }
+float sn3(vec3 x){ vec3 i = floor(x), f = fract(x); f = f*f*(3.0-2.0*f);
+  return mix(mix(mix(sh3(i), sh3(i+vec3(1,0,0)), f.x), mix(sh3(i+vec3(0,1,0)), sh3(i+vec3(1,1,0)), f.x), f.y),
+             mix(mix(sh3(i+vec3(0,0,1)), sh3(i+vec3(1,0,1)), f.x), mix(sh3(i+vec3(0,1,1)), sh3(i+vec3(1,1,1)), f.x), f.y), f.z); }
+float fbm(vec3 p){ float a = 0.5, s = 0.0; for (int i = 0; i < 4; i++){ s += a * sn3(p); p *= 2.03; a *= 0.5; } return s; }`)
+      .replace('#include <color_fragment>', `#include <color_fragment>
+if (uCrumble > 0.0) {   // stone flaking away in chunks, dark cracked rims around the holes
+  float cr = fbm(vStonePos * 9.0);
+  if (cr < uCrumble) discard;
+  diffuseColor.rgb *= mix(1.0, 0.3, smoothstep(uCrumble + 0.07, uCrumble, cr));
+}
+vec3 sp = vStonePos * uStoneScale;
+float n = fbm(sp);
+float vein = 1.0 - smoothstep(0.0, 0.06, abs(sin(sp.x * 0.35 + sp.y * 0.2 + fbm(sp * 0.5) * 5.0)));
+diffuseColor.rgb *= mix(1.0, 0.8 + 0.4 * n - 0.18 * vein, uStoneStrength);`)
+      .replace('#include <roughnessmap_fragment>', `#include <roughnessmap_fragment>
+roughnessFactor = clamp(roughnessFactor + (n - 0.5) * 0.25 * uStoneStrength, 0.05, 1.0);`);
+  };
+  mat.customProgramCacheKey = () => 'stone' + scale;
+}
+// the stage: a sunset colosseum (user's arena sheet) - same sky, light and haze as Unity's ChessSceneBuilder.Arena
+// (Unity z = -three z for these exports, so the sun direction's z is mirrored)
+const HAZE = new THREE.Color(0.86, 0.68, 0.5), SUN_DIR = new THREE.Vector3(0.55, 0.24, 0.8).normalize();
+scene.background = HAZE.clone();
+scene.fog = new THREE.Fog(HAZE.getHex(), 30, 130);
+const camera = new THREE.PerspectiveCamera(40, innerWidth / innerHeight, 0.05, 200);
+camera.position.set(3.6, 2.1, 2.2);
+const controls = new OrbitControls(camera, renderer.domElement);
+controls.target.set(0, 0.7, 0.5);
+controls.enableDamping = true;
+controls.autoRotate = true; controls.autoRotateSpeed = 0.35;
+
+// lights: a low golden sun as the key + four of the parapet's fire bowls (kept few for iGPU)
+scene.add(new THREE.HemisphereLight(0xc8d0e8, 0x5a4030, 0.8));
+const key = new THREE.DirectionalLight(0xffcc8e, 2.2);
+key.position.copy(SUN_DIR).multiplyScalar(8).add(new THREE.Vector3(0.5, 0, 0.5)); key.target.position.set(0.5, 0, 0.5); scene.add(key.target);
+key.castShadow = true;
+key.shadow.mapSize.set(1024, 1024); key.shadow.bias = -0.0004; key.shadow.normalBias = 0.02;
+Object.assign(key.shadow.camera, { left: -3, right: 3, top: 3, bottom: -3, near: 0.5, far: 15 });
+scene.add(key);
+const candles = [];   // the fire-bowl lights (flickered in the render loop); the other flames are emissive only
+for (const deg of [36, 144, 216, 324]) {   // arena.py: tall pedestals every 36 deg at r 10.25
+  const a = deg * Math.PI / 180, l = new THREE.PointLight(0xff9a48, 5, 9, 1.4);
+  l.position.set(0.5 + Math.cos(a) * 10, 1.9, 0.5 + Math.sin(a) * 10); scene.add(l); candles.push(l);
+}
+// sky dome: the same procedural golden-hour sky as Unity's Chess/SunsetSky (gradient, low sun, drifting clouds)
+const skyUniforms = { uTime: { value: 0 } };
+scene.add(new THREE.Mesh(new THREE.SphereGeometry(150, 32, 16), new THREE.ShaderMaterial({
+  side: THREE.BackSide, depthWrite: false, fog: false, uniforms: skyUniforms,
+  vertexShader: 'varying vec3 vDir; void main(){ vDir = position; gl_Position = projectionMatrix * modelViewMatrix * vec4(position + cameraPosition, 1.0); }',
+  fragmentShader: `uniform float uTime; varying vec3 vDir;
+    float hash(vec2 p){ return fract(sin(dot(p, vec2(127.1, 311.7))) * 43758.5453); }
+    float vnoise(vec2 x){ vec2 i = floor(x), f = fract(x); f = f * f * (3.0 - 2.0 * f);
+      return mix(mix(hash(i), hash(i + vec2(1, 0)), f.x), mix(hash(i + vec2(0, 1)), hash(i + vec2(1, 1)), f.x), f.y); }
+    float fbm(vec2 x){ return vnoise(x) * 0.5 + vnoise(x * 2.1) * 0.3 + vnoise(x * 4.3) * 0.2; }
+    void main(){
+      vec3 d = normalize(vDir), top = vec3(0.22, 0.42, 0.72), hor = vec3(1.0, 0.74, 0.46), sunc = vec3(1.0, 0.86, 0.6);
+      vec3 s = normalize(vec3(${SUN_DIR.x}, ${SUN_DIR.y}, ${SUN_DIR.z}));
+      float h = clamp(d.y, 0.0, 1.0), sd = clamp(dot(d, s), 0.0, 1.0);
+      vec3 c = mix(hor, top, pow(h, 0.45));
+      c = mix(c, hor * 1.05, pow(sd, 6.0) * (1.0 - h) * 0.8);
+      if (d.y < 0.0) c = hor * 0.85;
+      vec2 uv = d.xz / max(0.08, d.y) * 0.35 + uTime * vec2(0.004, 0.002);
+      float cl = smoothstep(0.5, 0.78, fbm(uv * 1.3)) * smoothstep(0.02, 0.2, d.y) * 0.8;
+      vec3 cc = mix(vec3(0.95, 0.9, 0.86), sunc * 1.2, pow(sd, 3.0)) * mix(0.75, 1.1, fbm(uv * 3.1 + 5.0));
+      c = mix(c, cc, cl);
+      float ang = acos(clamp(dot(d, s), -1.0, 1.0));
+      c += sunc * (0.5 * exp(-ang * 7.0) + 0.15 * exp(-ang * 1.8));
+      c = mix(c, sunc * 2.2, smoothstep(0.035, 0.03, ang) * (1.0 - cl * 0.7));
+      gl_FragColor = vec4(c, 1.0);
+    }`
+})));
+// the colosseum (BlenderSource/arena.py), centred on the board. Colour is in the vertex colours; vertex alpha says
+// how much a vertex may move: banners sway, the crowd bobs in a wave round the stands, flame tips flicker
+// (the same vertex motion as Unity's Chess/Arena shader).
+const arenaTime = { value: 0 };
+function arenaMat(kind) {
+  const P = { Marble: [0.55, 0], Gold: [0.35, 0.6], Cloth: [0.9, 0], Crowd: [0.9, 0], Fire: [1, 0], Dark: [0.95, 0] }[kind];
+  const m = new THREE.MeshStandardMaterial({ vertexColors: true, roughness: P[0], metalness: P[1], side: THREE.DoubleSide });
+  if (kind === 'Fire') { m.emissive = new THREE.Color(1, 0.55, 0.2); m.emissiveIntensity = 2.5; }
+  if (kind === 'Marble') stoneify(m, 2.2, 0.5);
+  const mode = { Cloth: 1, Crowd: 2, Fire: 3 }[kind] || 0;
+  if (mode) {
+    const prev = m.onBeforeCompile;
+    m.onBeforeCompile = (sh, r) => {
+      if (prev) prev(sh, r);
+      sh.uniforms.uTime = arenaTime;
+      sh.vertexShader = 'uniform float uTime;\nattribute float _w;\n' + sh.vertexShader.replace('#include <begin_vertex>', `#include <begin_vertex>
+        { float w = _w; vec3 wp = (modelMatrix * vec4(transformed, 1.0)).xyz; float t = uTime;
+          float ph = dot(wp, vec3(0.7, 0.31, 0.53));
+          ${mode === 1 ? 'transformed += w * vec3(sin(t * 1.7 + ph), 0.0, cos(t * 1.3 + ph * 1.3)) * 0.09;' : ''}
+          ${mode === 2 ? 'float ang = atan(wp.z, wp.x); transformed.y += w * (max(0.0, sin(ang * 6.0 - t * 2.2)) * 0.12 + max(0.0, sin(t * 7.0 + ang * 40.0)) * 0.03);' : ''}
+          ${mode === 3 ? 'transformed += w * vec3(sin(t * 13.0 + ph * 5.0) * 0.04, sin(t * 17.0 + ph * 3.0) * 0.07, cos(t * 11.0 + ph * 7.0) * 0.04);' : ''}
+        }`);
+    };
+    m.customProgramCacheKey = () => 'arena' + kind;
+  }
+  return m;
+}
+new GLTFLoader().loadAsync('models/Arena.glb?v=' + Date.now()).then(g => {
+  const st = g.scene; st.position.set(0.5, 0, 0.5);
+  st.traverse(o => {
+    if (!o.isMesh) return;
+    o.receiveShadow = true;
+    o.geometry.setAttribute('color', o.geometry.attributes._c);   // arena.py "_c": COLOR_0 came out white for all but one primitive
+    o.material = arenaMat(o.material.name.replace('Arena', ''));
+  });
+  scene.add(st); window.arenaRoot = st;   // debug handle
+});
+
+// board 8x8, 1 unit squares, polished
+const board = new THREE.Group();
+const light = new THREE.MeshStandardMaterial({ color: 0xbfb8a8, roughness: 0.22 }); stoneify(light, 2.2, 0.9);
+const dark = new THREE.MeshStandardMaterial({ color: 0x1d1b1a, roughness: 0.18 }); stoneify(dark, 2.2, 0.9);
+const sq = new THREE.BoxGeometry(1, 0.1, 1);
+for (let i = 0; i < 8; i++) for (let j = 0; j < 8; j++) {
+  const m = new THREE.Mesh(sq, (i + j) % 2 ? dark : light);
+  m.position.set(i - 3.5, -0.05, j - 3.5); m.receiveShadow = true; board.add(m);
+}
+const rim = new THREE.Mesh(new THREE.BoxGeometry(8.6, 0.16, 8.6), new THREE.MeshStandardMaterial({ color: 0x2a1c12, roughness: 0.5 }));
+rim.position.y = -0.09; board.add(rim);
+board.position.set(0.5, 0, 0.5);   // pieces stand on square centres
+scene.add(board);
+
+const status = document.getElementById('status');
+const say = t => status.textContent = t;
+const sleep = ms => new Promise(r => setTimeout(r, ms));
+// a pawn wears its daggers sheathed: it draws them (and waits in guard) once a fight is coming
+async function drawLater(p, ms, alive) {
+  await sleep(ms); if (!alive()) return;
+  const d = p.play('Draw', { once: true, fade: 0.1 }); await sleep(d); if (!alive()) return;
+  if (p.current === p.mixer.clipAction(p.clips.Draw)) p.play('Ready');
+}
+
+// ---------- pieces
+// each piece type: model + clips + forward speed per phase of its Walk cycle (measured in Blender from the
+// planted foot, so walking never slides)
+const loader = new GLTFLoader(), v = '?v=' + Date.now();
+async function loadType(name) {
+  const g = await loader.loadAsync(`models/${name}.glb${v}`);
+  return { gltf: g, clips: Object.fromEntries(g.animations.map(a => [a.name.split('|').pop(), a])),
+           walk: await (await fetch(`models/${name}_walk.json${v}`)).json() };
+}
+const TYPES = { Pawn: await loadType('Pawn'), Knight: await loadType('Knight'), Bishop: await loadType('Bishop'), Rook: await loadType('Rook'), Queen: await loadType('Queen'), King: await loadType('King') };
+const gltf = TYPES.Pawn.gltf;
+
+function makePiece(black, type = 'Pawn') {
+  const T = TYPES[type], clips = T.clips;
+  const root = SkeletonUtils.clone(T.gltf.scene);
+  root.traverse(o => {
+    if (!o.isMesh) return;
+    o.castShadow = true; o.receiveShadow = true;
+    o.material = o.material.clone();
+    if (o.material.name === 'PieceBody') {
+      if (black) { o.material.color.set(0x2c2c31); o.material.roughness = 0.38; }
+      else { o.material.color.set(0xc9c6bf); o.material.roughness = 0.5; }
+      stoneify(o.material);
+    } else if (o.material.name === 'Glow') {   // the bishop's orb
+      o.material = new THREE.MeshStandardMaterial({ color: 0xbfe0ff, emissive: 0x6aa8ff, emissiveIntensity: 1.2, name: 'Glow' });
+    } else if (o.material.name === 'Trim') {   // gilded accents (design board)
+      o.material.color.set(black ? 0xb08a48 : 0xd4a85c); o.material.metalness = 1; o.material.roughness = 0.3;
+      stoneify(o.material, 38, 0.25);
+    }
+  });
+  const mixer = new THREE.AnimationMixer(root);
+  const mats = [], bones = [];
+  root.traverse(o => {
+    if (o.isMesh && o.material.userData.uCrumble) mats.push(o.material);
+    if (o.isBone) bones.push(o);
+  });
+  const p = { root, mixer, current: null, bones, clips, walkCurve: T.walk, type };
+  root.traverse(o => { if (o.isMesh && o.material.name === 'Glow') p.glow = o.material; });
+  p.setCrumble = v => mats.forEach(m => m.userData.uCrumble.value = v);
+  p.play = (name, { once = false, fade = 0.2 } = {}) => {
+    const a = mixer.clipAction(clips[name]);
+    a.reset(); a.setLoop(once ? THREE.LoopOnce : THREE.LoopRepeat); a.clampWhenFinished = once;
+    if (p.current && p.current !== a) a.crossFadeFrom(p.current, fade, false);
+    a.play(); p.current = a;
+    return clips[name].duration * 1000;
+  };
+  scene.add(root);
+  return p;
+}
+const white = makePiece(false), black = makePiece(true), knight = makePiece(false, 'Knight'), bishop = makePiece(false, 'Bishop'), rook = makePiece(false, 'Rook'), queen = makePiece(false, 'Queen'), king = makePiece(false, 'King');
+const black2 = makePiece(true), black3 = makePiece(true); black2.root.visible = black3.root.visible = false;
+knight.root.visible = false; bishop.root.visible = false; rook.root.visible = false; queen.root.visible = false; king.root.visible = false;
+
+// ---------- battle script
+let token = 0;
+// Walk toward z: the piece advances by the measured foot-lock speed for the current phase of the Walk
+// clip, so the foot carrying the weight stays planted on the board (driven from the render loop).
+function moveTo(p, z) {
+  p.play('Walk');
+  return new Promise(res => { p.walk = { z, res, my: token }; });
+}
+function stepWalk(p, dt) {
+  const w = p.walk; if (!w) return;
+  if (w.my !== token) { p.walk = null; return; }
+  const a = p.current, dur = a.getClip().duration;
+  const phase = (a.time % dur) / dur, sp = p.walkCurve.speed;
+  footDust(p, phase);
+  const v = sp[Math.min(sp.length - 1, Math.floor(phase * sp.length))] * a.getEffectiveWeight();
+  const dir = Math.sign(w.z - p.root.position.z);
+  p.root.position.z += dir * v * dt;
+  if (Math.sign(w.z - p.root.position.z) !== dir || dir === 0) { p.root.position.z = w.z; p.walk = null; w.res(); }
+}
+// stone statues crumble while they die: the surface flakes away (shader) and chunks fall off the limbs
+const rubbleGeo = [new THREE.DodecahedronGeometry(1, 0), new THREE.IcosahedronGeometry(1, 0), new THREE.BoxGeometry(1.4, 1, 1.2)];
+let rubble = [];
+const _v = new THREE.Vector3();
+function chunk(p, at, size, kick) {
+  const m = new THREE.Mesh(rubbleGeo[(Math.random() * 3) | 0], p.rubbleMat);
+  const r = size * (0.5 + Math.random());
+  m.scale.set(r, r * (0.6 + Math.random() * 0.6), r);
+  m.position.copy(at).add(new THREE.Vector3((Math.random() - .5) * .12, (Math.random() - .5) * .12, (Math.random() - .5) * .12));
+  m.rotation.set(Math.random() * 6, Math.random() * 6, Math.random() * 6);
+  m.castShadow = true;
+  m.userData.v = new THREE.Vector3((Math.random() - .5) * kick, Math.random() * kick * 0.6, (Math.random() - .5) * kick);
+  m.userData.r = r; m.userData.spin = (Math.random() - .5) * 10;
+  scene.add(m); rubble.push(m);
+}
+async function dieCrumbling(p, durMs, start = 0.12) {   // start: fraction of durMs when the blow lands
+  const my = token, t0 = performance.now();
+  let next = 0;
+  const base = p.root.getObjectByProperty('type', 'SkinnedMesh').material;   // rubble gets its own fadeable stone
+  p.rubbleMat = new THREE.MeshStandardMaterial({ color: base.color.clone(), roughness: base.roughness, transparent: true });
+  stoneify(p.rubbleMat);
+  const mine = () => rubble.filter(m => m.material === p.rubbleMat);
+  while (performance.now() - t0 < durMs) {
+    if (my !== token) return;
+    const u = (performance.now() - t0) / durMs;
+    const c = Math.max(0, (u - start) / (1 - start));          // starts cracking right after the blow lands
+    p.setCrumble(c * c * 0.62);                         // eaten-away fraction grows as it falls
+    if (performance.now() - t0 > next && u > start) {    // pieces drop off random limbs as it goes
+      const b = p.bones[(Math.random() * p.bones.length) | 0];
+      chunk(p, b.getWorldPosition(_v), 0.03 + c * 0.03, 0.6);
+      next = performance.now() - t0 + 70 - c * 40;
+    }
+    await sleep(16);
+  }
+  for (const b of p.bones) {                            // the rest collapses into a heap where it lay
+    b.getWorldPosition(_v);
+    for (let i = 0; i < 3; i++) chunk(p, _v, 0.045, 1.0);
+  }
+  p.root.visible = false;
+  // the heap settles, then fades away to nothing
+  await sleep(1600); if (my !== token) return;
+  const f0 = performance.now();
+  p.rubbleMat.depthWrite = false;
+  while (performance.now() - f0 < 2200) {
+    if (my !== token) return;
+    const u = (performance.now() - f0) / 2200;
+    p.rubbleMat.opacity = 1 - u * u;
+    for (const m of mine()) m.scale.multiplyScalar(0.997);   // and crumbles a little smaller as it goes
+    await sleep(16);
+  }
+  for (const m of mine()) scene.remove(m);
+  rubble = rubble.filter(m => m.material !== p.rubbleMat);
+}
+function stepRubble(dt) {
+  for (const m of rubble) {
+    const v = m.userData.v;
+    if (m.position.y <= m.userData.r * 0.7 && v.y <= 0) { v.multiplyScalar(0.0); continue; }
+    v.y -= 9.8 * dt * 0.6;
+    m.position.addScaledVector(v, dt);
+    m.rotation.x += m.userData.spin * dt;
+    if (m.position.y < m.userData.r * 0.7) { m.position.y = m.userData.r * 0.7; v.y = -v.y * 0.25; v.x *= 0.5; v.z *= 0.5; if (Math.abs(v.y) < 0.15) v.y = 0; }
+  }
+}
+// sparks where steel meets steel
+let sparks = [];
+const sparkGeo = new THREE.BoxGeometry(0.012, 0.012, 0.05);
+const flash = new THREE.PointLight(0xffc27a, 0, 3, 2); scene.add(flash);
+function sparkBurst(at, color = 0xffd08a) {
+  for (let i = 0; i < 40; i++) {
+    const m = new THREE.Mesh(sparkGeo, new THREE.MeshBasicMaterial({ color, transparent: true, blending: THREE.AdditiveBlending, depthWrite: false }));
+    m.position.copy(at);
+    const v = new THREE.Vector3(Math.random() - .5, Math.random() * 0.9, Math.random() - .5).normalize().multiplyScalar(1.5 + Math.random() * 2.5);
+    m.userData = { v, life: 0.25 + Math.random() * 0.35, age: 0 };
+    scene.add(m); sparks.push(m);
+  }
+  flash.position.copy(at); flash.intensity = 6;
+}
+function stepSparks(dt) {
+  for (const m of sparks) {
+    const u = m.userData; u.age += dt; u.v.y -= 6 * dt;
+    m.position.addScaledVector(u.v, dt); m.lookAt(m.position.clone().add(u.v));
+    m.material.opacity = Math.max(0, 1 - u.age / u.life);
+  }
+  sparks = sparks.filter(m => m.userData.age < m.userData.life || (scene.remove(m), false));
+  flash.intensity = Math.max(0, flash.intensity - dt * 30);
+}
+// impact: camera kick + a spray of stone chips from the point of contact
+let shake = 0;
+function impact(at, strength) {
+  shake = strength;
+  for (let i = 0; i < 14; i++) chunk(black, at, 0.018, 2.2);
+}
+// --- effects (battle sheet "ディテール・エフェクト例"): guard/shield flash, foot dust, magic circle + motes
+let fx = [];   // { mesh, age, life, step(m, u, dt) }
+const fxGeo = { ring: new THREE.RingGeometry(0.7, 1, 40), disc: new THREE.CircleGeometry(1, 20) };
+function addFx(mesh, life, step, billboard = true) { mesh.userData.billboard = billboard; scene.add(mesh); fx.push({ mesh, age: 0, life, step }); return mesh; }
+function addMat(color, opacity = 1) {
+  return new THREE.MeshBasicMaterial({ color, transparent: true, opacity, blending: THREE.AdditiveBlending, depthWrite: false, side: THREE.DoubleSide });
+}
+// a blow stopped by a blade / shield: a bright ring bursting out where they meet, facing the camera
+function guardFlash(at, color = 0xcfe4ff) {
+  for (let i = 0; i < 2; i++) {
+    const m = new THREE.Mesh(fxGeo.ring, addMat(color)); m.position.copy(at);
+    addFx(m, 0.32 + i * 0.1, (m, u) => { m.scale.setScalar(0.04 + (0.32 + i * 0.12) * Math.sqrt(u)); m.material.opacity = 1 - u; });
+  }
+  sparkBurst(at); shake = Math.max(shake, 0.03);
+}
+// dust kicked up off the board (footfalls, lunges, landings)
+function dust(at, size = 1, n = 6) {
+  for (let i = 0; i < n; i++) {
+    const m = new THREE.Mesh(fxGeo.disc, new THREE.MeshBasicMaterial({ color: 0xb8ab96, transparent: true, opacity: 0.35, depthWrite: false }));
+    const a = Math.random() * Math.PI * 2, r = (0.05 + Math.random() * 0.12) * size;
+    m.position.set(at.x + Math.cos(a) * r, 0.04 + Math.random() * 0.04, at.z + Math.sin(a) * r);
+    const vel = new THREE.Vector3(Math.cos(a), 0.6 + Math.random() * 0.5, Math.sin(a)).multiplyScalar(0.25 * size);
+    addFx(m, 0.7 + Math.random() * 0.4, (m, u, dt) => {
+      m.position.addScaledVector(vel, dt); vel.multiplyScalar(Math.pow(0.15, dt));
+      m.scale.setScalar((0.04 + 0.14 * Math.sqrt(u)) * size); m.material.opacity = 0.35 * (1 - u);
+    });
+  }
+}
+// queen's spell: a violet circle opens on the board under her and motes spiral up around her
+function magicCircle(at, ms) {
+  const life = ms / 1000;
+  for (const [r0, spin] of [[1, 0.8], [0.62, -1.4]]) {
+    const m = new THREE.Mesh(fxGeo.ring, addMat(0xa77bff, 0)); m.rotation.x = -Math.PI / 2; m.position.set(at.x, 0.03, at.z);
+    addFx(m, life, (m, u, dt) => { m.rotation.z += spin * dt; m.scale.setScalar(0.55 * r0 * Math.min(1, u * 4));
+      m.material.opacity = 0.9 * Math.min(1, u * 5) * (u > 0.85 ? (1 - u) / 0.15 : 1); }, false);
+  }
+  for (let i = 0; i < 26; i++) {
+    const m = new THREE.Mesh(fxGeo.disc, addMat(0xc9a6ff, 0)); const a0 = Math.random() * Math.PI * 2, h0 = Math.random() * 0.3;
+    const delay = Math.random() * 0.6;
+    addFx(m, life, (m, u) => { const t = Math.max(0, u * life - delay); const a = a0 + t * 4;
+      m.position.set(at.x + Math.cos(a) * 0.4, 0.1 + h0 + t * 0.7, at.z + Math.sin(a) * 0.4);
+      m.scale.setScalar(0.025); m.material.opacity = t > 0 ? 0.9 * (1 - u) : 0; });
+  }
+  flash.position.set(at.x, 0.6, at.z); flash.color.set(0xa77bff); flash.intensity = 30;
+}
+let fxScale = 1;   // debug: 0 freezes the effects (preview.freeze)
+function stepFx(dt) {
+  dt *= fxScale;
+  for (const f of fx) {
+    f.age += dt; const u = Math.min(1, f.age / f.life);
+    if (f.mesh.userData.billboard) f.mesh.quaternion.copy(camera.quaternion);
+    f.step(f.mesh, u, dt);
+  }
+  fx = fx.filter(f => f.age < f.life || (scene.remove(f.mesh), false));
+}
+// a pawn answering a piece that stands further off than its strike reaches leaps the extra distance in, then
+// springs back (the blow itself is still the pawn's AttackBlocked, solved for one square)
+function lungeIn(p, extra, clip) {
+  const a = p.mixer.clipAction(p.clips[clip]), base = p.root.position.clone();
+  const dir = new THREE.Vector3(Math.sin(p.root.rotation.y), 0, Math.cos(p.root.rotation.y));
+  p.lunge = { a, base, dir, extra, my: token };
+}
+function stepLunge(p) {
+  const l = p.lunge; if (!l) return;
+  if (l.my !== token) { p.lunge = null; return; }
+  const f = l.a.time * 24, k = f < 16 ? Math.sin(Math.min(1, Math.max(0, (f - 3) / 13)) * Math.PI / 2) : Math.max(0, 1 - (f - 22) / 14);
+  p.root.position.copy(l.base).addScaledVector(l.dir, l.extra * Math.max(0, Math.min(1, k)));
+  if (!l.a.isRunning() || f > 36) { p.root.position.copy(l.base); p.lunge = null; }
+}
+// footfalls: a puff of dust under each foot as the walk cycle plants it
+function footDust(p, phase) {
+  const last = p._phase ?? phase; p._phase = phase;
+  for (const at of [0.02, 0.52]) if (last < at && phase >= at || (last > phase && at < phase)) {
+    const side = at < 0.5 ? 1 : -1, yaw = p.root.rotation.y;
+    dust(new THREE.Vector3(p.root.position.x + Math.cos(yaw) * 0.12 * side, 0, p.root.position.z - Math.sin(yaw) * 0.12 * side), 0.5, 3);
+  }
+}
+function clearRubble() { rubble.forEach(m => scene.remove(m)); rubble = []; }
+
+function place() {
+  clearRubble(); black.lunge = null; black2.root.visible = black3.root.visible = false; white.root.visible = black.root.visible = true; knight.root.visible = false; knight.walk = null; knight.walkv = null; knight.glide = null;
+  bishop.root.visible = false; bishop.walk = null; rook.root.visible = false; rook.walk = null; queen.root.visible = false; queen.walk = null; king.root.visible = false; king.walk = null; if (bishop.glow) bishop.glow.emissiveIntensity = 1.2;
+  white.setCrumble(0); black.setCrumble(0); knight.setCrumble(0);
+  white.root.position.set(0, 0, 2); white.root.rotation.y = Math.PI;   // models face +Z
+  black.root.position.set(0, 0, -1); black.root.rotation.y = 0;
+}
+// hit frames of the pawn's strings (BlenderSource/anims.py PAWN_COMBOS -> export.py)
+const PAWN_EVENTS = await (await fetch(`models/Pawn_events.json${v}`)).json();
+const CUT = 0.306;   // the point 85% along the blade that the cuts are solved onto (anims.py SLASH_CUT)
+function boneOf(p, name) { return p.bones.find(b => b.name === name || b.name === name.replace('.', '')); }
+async function battle() {
+  // design sheets "ポーン（双剣）": the fight flows from one string into the next with no stops - every exchange
+  // is timed off the clips' own clocks (not wall-clock sleeps), and the next one fades in just before the last ends.
+  // Rule: a weapon reaching the BODY kills; every blow before the last lands on a blade.
+  const my = ++token; setActive('battle');
+  const alive = () => my === token;
+  controls.autoRotate = true;
+  const atFrame = async (p, f) => { const a = p.current; while (alive() && a.isRunning() && a.time < f / 24) await sleep(8); };
+  const nearEnd = async (p, lead = 0.12) => { const a = p.current; while (alive() && a.isRunning() && a.time < a.getClip().duration - lead) await sleep(8); };
+  const guardX = q => boneOf(q, 'weapon').getWorldPosition(new THREE.Vector3()).add(boneOf(q, 'weapon.L').getWorldPosition(new THREE.Vector3()))
+    .multiplyScalar(0.5).add(new THREE.Vector3(0, 0.1, 0));
+  const cutPoint = (q, bone) => boneOf(q, bone).localToWorld(new THREE.Vector3(0, CUT, 0));
+  // attacker plays a string, defender its answer; sparks fly on every hit frame where the blade meets the guard
+  async function exchange(a, aClip, d, dClip) {
+    a.play(aClip, { once: true, fade: 0.15 }); d.play(dClip, { once: true, fade: 0.15 });
+    for (const [f, bone] of (PAWN_EVENTS[aClip] || [])) {
+      await atFrame(a, f); if (!alive()) return false;
+      const at = bone === 'x' ? guardX(a) : cutPoint(a, bone);
+      sparkBurst(at); shake = Math.max(shake, 0.025);
+    }
+    await nearEnd(a); return alive();
+  }
+  while (alive()) {
+    place(); white.play('Idle', { fade: 0 }); black.play('Idle', { fade: 0 });
+    say('白のポーンが前進'); await sleep(1000); if (!alive()) return;
+    await moveTo(white, 0); if (!alive()) return;
+    say('構え合い — 両手を腰へ、腕をクロスして溜める'); white.play('Draw', { once: true, fade: 0.1 }); black.play('Draw', { once: true, fade: 0.1 });
+    await at24(white, 40, alive); say('同時に抜刀！');
+    for (const p of [white, black]) for (const b of ['weapon', 'weapon.L']) sparkBurst(boneOf(p, b).getWorldPosition(new THREE.Vector3()), 0xbfd4ff);   // the blades leave the scabbards
+    await nearEnd(white, 0.1); if (!alive()) return;
+    white.play('Ready', { fade: 0.15 }); black.play('Ready', { fade: 0.15 }); await sleep(500); if (!alive()) return;
+    say('斬り合い'); white.play('Clash', { once: true, fade: 0.15 }); black.play('Clash', { once: true, fade: 0.15 });
+    await atFrame(white, 15); if (!alive()) return;
+    const mid = cutPoint(white, 'weapon').add(cutPoint(black, 'weapon')).multiplyScalar(0.5); sparkBurst(mid); shake = Math.max(shake, 0.03);
+    await nearEnd(white); if (!alive()) return;
+    say('白の通常コンボ — 黒は双剣で受け続ける'); if (!await exchange(white, 'Combo', black, 'DefendCombo')) return;
+    say('黒の重攻撃 — 跳び込んで斬り下ろす'); if (!await exchange(black, 'Heavy', white, 'DefendHeavy')) return;
+    say('黒の突きを受け流し、白の反撃'); if (!await exchange(white, 'Counter', black, 'Parried')) return;
+    say('黒のラッシュ'); if (!await exchange(black, 'Rush', white, 'DefendRush')) return;
+    say('白の二連斬り — 追撃が体を断つ'); white.play('Attack', { once: true, fade: 0.15 });
+    const dd = black.play('Death', { once: true, fade: 0.15 });
+    const dying = dieCrumbling(black, dd * 0.75, 0.29);
+    await atFrame(white, 16); if (!alive()) return; impact(cutPoint(white, 'weapon'), 0.06);
+    await nearEnd(white, 0.05); if (!alive()) return;
+    say('決着 — 白の勝利！'); white.play('Victory', { once: true, fade: 0.2 });
+    await dying; if (!alive()) return;
+    await sleep(2500);
+  }
+}
+// blade trails (design sheet: arcs of light behind fast cuts): a short ribbon from guard to point, only while the
+// blade is moving fast
+const trailMat = new THREE.MeshBasicMaterial({ vertexColors: true, transparent: true, blending: THREE.AdditiveBlending,
+  depthWrite: false, side: THREE.DoubleSide });
+const TRAIL_N = 9, BLADE = [0.09, 0.36];   // guard and point along the bone (board units; anims.py DAGGER_L)
+// which moves leave a trail: the pawn's daggers only in the spinning slash (user: "双剣の残影は回転切りの時だけ");
+// the swords and the lance in their big swings (battle sheet "武器の軌道（剣・槍）")
+const TRAIL_RULES = {
+  Pawn: { blade: [0.09, 0.36], color: [0.75, 0.85, 1], when: (c, t) => (c === 'Attack' && t > 5 && t < 24) || (c === 'Draw' && t > 41 && t < 63) },
+  Queen: { blade: [0.5, 0.95], color: [0.85, 0.7, 1], when: (c, t) => ((c === 'Attack' || c === 'AttackBlocked') && t > 9 && t < 24) || (c === 'Combo' && t > 4 && t < 62) },
+  Rook: { blade: [0.12, 0.85], color: [1, 0.9, 0.65], when: (c, t) => c === 'Iai' && t > 52 && t < 68 },
+  King: { blade: [0.12, 0.945], color: [1, 0.85, 0.55], when: (c, t) => (c === 'Attack' || c === 'AttackBlocked') && t > 10 && t < 22 },
+  Knight: { blade: [0.3, 0.42], color: [1, 0.85, 0.55], when: (c, t) => (c === 'LeapAttack' && t > 24 && t < 34) || (c === 'Attack' && t > 14 && t < 46) || (c === 'Sweep' && t > 16 && t < 32)
+            || (c === 'Combo' && t > 4 && t < 48) || (c === 'Skill' && t > 19 && t < 42) },
+};
+function addTrails(p) {
+  p.trails = []; p.trailRule = TRAIL_RULES[p.type];
+  for (const name of ['weapon', 'weaponL', 'weapon.L']) {
+    const bone = p.bones.find(b => b.name === name); if (!bone || p.trails.some(t => t.bone === bone)) continue;
+    const geo = new THREE.BufferGeometry();
+    geo.setAttribute('position', new THREE.BufferAttribute(new Float32Array(TRAIL_N * 2 * 3), 3));
+    geo.setAttribute('color', new THREE.BufferAttribute(new Float32Array(TRAIL_N * 2 * 3), 3));
+    const idx = []; for (let k = 0; k < TRAIL_N - 1; k++) { const a = 2 * k; idx.push(a, a + 1, a + 2, a + 1, a + 3, a + 2); }
+    geo.setIndex(idx);
+    const mesh = new THREE.Mesh(geo, trailMat); mesh.frustumCulled = false; scene.add(mesh);
+    p.trails.push({ bone, mesh, hist: [] });
+  }
+}
+function stepTrails(p, dt) {
+  for (const t of p.trails || []) {
+    const rule = p.trailRule, a = t.bone.localToWorld(new THREE.Vector3(0, rule.blade[0], 0)), b = t.bone.localToWorld(new THREE.Vector3(0, rule.blade[1], 0));
+    const last = t.hist[0], speed = last ? b.distanceTo(last.b) / Math.max(dt, 1e-3) : 0;
+    const cur = p.current, spin = cur && rule.when(cur.getClip().name.split('|').pop(), cur.time * 24);
+    if (!spin || !p.root.visible) t.hist.length = 0;
+    t.hist.unshift({ a, b, w: p.root.visible && spin && speed > 1.5 ? Math.min(1, (speed - 1.5) / 3) : 0 });
+    if (t.hist.length > TRAIL_N) t.hist.length = TRAIL_N;
+    const pos = t.mesh.geometry.attributes.position, col = t.mesh.geometry.attributes.color;
+    for (let k = 0; k < TRAIL_N; k++) {
+      const h = t.hist[Math.min(k, t.hist.length - 1)], f = h.w * (1 - k / (TRAIL_N - 1));
+      pos.setXYZ(2 * k, h.a.x, h.a.y, h.a.z); pos.setXYZ(2 * k + 1, h.b.x, h.b.y, h.b.z);
+      const c = rule.color; col.setXYZ(2 * k, 0.3 * c[0] * f, 0.3 * c[1] * f, 0.3 * c[2] * f); col.setXYZ(2 * k + 1, c[0] * f, c[1] * f, c[2] * f);
+    }
+    pos.needsUpdate = col.needsUpdate = true;
+  }
+}
+addTrails(white); addTrails(black); addTrails(queen); addTrails(king); addTrails(knight); addTrails(rook);
+// the knight's move (BlenderSource/knight_anims.py): it springs and glides along its L (sqrt 5 squares). The clip
+// carries height and pitch; here the knight is carried across the board linearly from KN_TAKEOFF to KN_TOUCH.
+const KN = { TAKEOFF: 10, TOUCH: 34, HIT: 30, MOVE: Math.sqrt(5), LAND_SHORT: 0.6 };
+function faceToward(p, to) {
+  const d = to.clone().sub(p.root.position); p.root.rotation.y = Math.atan2(d.x, d.z);   // models face +Z
+}
+function glide(p, to, clip) {
+  const from = p.root.position.clone(), a = p.mixer.clipAction(p.clips[clip]);
+  p.glide = { from, to, a, my: token };
+}
+function stepGlide(p) {
+  const g = p.glide; if (!g) return;
+  if (g.my !== token) { p.glide = null; return; }
+  const u = Math.min(1, Math.max(0, (g.a.time * 24 - KN.TAKEOFF) / (KN.TOUCH - KN.TAKEOFF)));
+  p.root.position.lerpVectors(g.from, g.to, u);
+  if (u >= 1) p.glide = null;
+}
+// walk in a straight line to a point (any direction), feet locked like moveTo
+function walkTo(p, to) {
+  faceToward(p, to); p.play('Walk');
+  return new Promise(res => { p.walkv = { to: to.clone(), res, my: token }; });
+}
+function stepWalkV(p, dt) {
+  const w = p.walkv; if (!w) return;
+  if (w.my !== token) { p.walkv = null; return; }
+  const a = p.current, dur = a.getClip().duration, sp = p.walkCurve.speed;
+  const v = sp[Math.min(sp.length - 1, Math.floor((a.time % dur) / dur * sp.length))] * a.getEffectiveWeight();
+  const d = w.to.clone().sub(p.root.position), len = d.length();
+  if (len <= v * dt || len < 1e-4) { p.root.position.copy(w.to); p.walkv = null; w.res(); return; }
+  p.root.position.addScaledVector(d.divideScalar(len), v * dt);
+}
+// storyboard row 2 (revised by the user): the knight glides along its L-move; the pawn on the target square is
+// speared on the way down, the knight lands just short of it and then walks into the square
+async function knightGlide() {
+  const my = ++token; setActive('knightGlide');
+  const alive = () => my === token;
+  controls.autoRotate = true;
+  camera.position.set(4.6, 2.8, 2.6); controls.target.set(0.3, 0.6, 0.0);
+  const target = new THREE.Vector3(0, 0, -1), start = new THREE.Vector3(1, 0, 1);   // an L: one across, two forward
+  while (alive()) {
+    place(); white.root.visible = false;
+    knight.root.visible = true; knight.root.position.copy(start); faceToward(knight, target);
+    knight.play('Idle', { fade: 0 }); black.play('Idle', { fade: 0 }); drawLater(black, 400, alive);
+    say('白のナイト — L字の先に黒のポーン'); await sleep(2300); if (!alive()) return;
+    say('ナイトが滑空！');
+    const dir = target.clone().sub(start).normalize();
+    const d = knight.play('LeapAttack', { once: true, fade: 0.1 });
+    glide(knight, start.clone().addScaledVector(dir, KN.MOVE - KN.LAND_SHORT), 'LeapAttack');
+    at24(knight, KN.TAKEOFF, alive).then(() => alive() && dust(start, 1.2, 8));
+    at24(knight, KN.TOUCH, alive).then(() => alive() && dust(knight.root.position, 1.4, 10));
+    await sleep((KN.HIT - 16) / 24 * 1000); if (!alive()) return;   // the pawn's Death takes the blow on its frame 16
+    const dd = black.play('Death', { once: true });
+    const dying = dieCrumbling(black, dd * 0.75, 0.29);
+    await sleep(16 / 24 * 1000); if (!alive()) return;               // KN.HIT: the lance goes in
+    const hitAt = new THREE.Vector3(0, 0.68, -1.0);
+    sparkBurst(hitAt); impact(hitAt, 0.08);
+    await sleep(d - KN.HIT / 24 * 1000); if (!alive()) return;
+    say('着地 — ナイトがそのマスへ'); await walkTo(knight, target); if (!alive()) return;
+    say('白の勝利！ 馬が棹立ち'); knight.play('Victory', { once: true });
+    await dying; if (!alive()) return;
+    await sleep(2500);
+  }
+}
+// the sword duel (sheet "ナイト | 詳細モーション・攻撃シーン"): the knight rides up, draws, runs its 12-beat combo
+// into the pawn's crossed blades, then the light skill - two blows of light caught on the guard, and the wide
+// sweep that cuts the pawn down (knight_anims.py KN_COMBO / KN_SKILL_*; frames shared with anims.py)
+const KN_COMBO_FRAMES = [8, 13, 18, 23, 28, 33, 38, 45], KN_SKILL = { GUARD: [22, 28], KILL: 36 }, KN_MACE = { GUARD: [20, 26, 32], KILL: 40 }, KN_SWEEP = 24;
+async function knightBattle() {
+  const my = ++token; setActive('knight');
+  const alive = () => my === token;
+  controls.autoRotate = true;
+  camera.position.set(4.6, 2.6, 2.6); controls.target.set(0, 0.7, -0.2);
+  const swordPoint = () => boneOf(knight, 'weapon').localToWorld(new THREE.Vector3(0, 0.375, 0));   // the spiked ball
+  while (alive()) {
+    place(); white.root.visible = false;
+    knight.root.visible = true; knight.root.position.set(0, 0, 1.8); knight.root.rotation.y = Math.PI;
+    knight.play('Idle', { fade: 0 }); black.play('Idle', { fade: 0 }); drawLater(black, 1200, alive);
+    say('白のナイトが進み出る'); await sleep(1000); if (!alive()) return;
+    await moveTo(knight, 0.0); if (!alive()) return;
+    // the pawn stands at the knight's right front, where the sweep lands (knight_anims.py KN_SWEEP_PAWN)
+    black.root.position.set(0.55, 0, -0.62); black.root.rotation.y = Math.atan2(-0.55, 0.62);
+    say('モーニングスターを取る'); knight.play('Draw', { once: true, fade: 0.15 }); await nearEnd24(knight, alive, 0.1); if (!alive()) return;
+    knight.play('Idle', { fade: 0.15 }); await sleep(400); if (!alive()) return;
+    // user: "ナイトの攻撃は豪快な一払い" - one huge sweep (knight_anims.py Sweep, the pawn is taken on KN_SWEEP)
+    say('大きく振りかぶる'); knight.play('Sweep', { once: true, fade: 0.15 });
+    // the pawn braces the moment the knight winds up: its clip shares the sweep's clock (kill on frame 24 of both)
+    const dd = black.play('DieToKnightSweep', { once: true, fade: 0.1 });
+    const dying = dieCrumbling(black, dd * 0.75, (KN_SWEEP / 24 * 1000) / (dd * 0.75));
+    await at24(knight, 6, alive); dust(knight.root.position, 1.1, 8);
+    await at24(knight, KN_SWEEP, alive); if (!alive()) return;
+    say('豪快な一払い！'); const hitAt = new THREE.Vector3(0.47, 0.7, -0.53);
+    sparkBurst(hitAt, 0xffd890); sparkBurst(hitAt, 0xffffff); impact(hitAt, 0.16);
+    shockwave(new THREE.Vector3(0.55, 0, -0.62), 0xffd890); dust(new THREE.Vector3(0.55, 0, -0.62), 2.0, 16);
+    await at24(knight, KN_SWEEP + 10, alive); dust(knight.root.position, 1.2, 8);   // the horse rears on the follow-through
+    await nearEnd24(knight, alive, 0.1); if (!alive()) return;
+    say('白の勝利！ 馬が嘶く'); knight.play('Victory', { once: true, fade: 0.2 });
+    await dying; if (!alive()) return;
+    await sleep(2500);
+  }
+}
+async function knightSkill() {
+  const my = ++token; setActive('knightSkill');
+  const alive = () => my === token;
+  controls.autoRotate = true;
+  camera.position.set(4.6, 2.6, 2.6); controls.target.set(0, 0.7, -0.2);
+  const ball = () => boneOf(knight, 'weapon').localToWorld(new THREE.Vector3(0, 0.375, 0));
+  while (alive()) {
+    place(); white.root.visible = false;
+    knight.root.visible = true; knight.root.position.set(0, 0, 0); knight.root.rotation.y = Math.PI;
+    knight.play('Idle', { fade: 0 }); black.play('Ready', { fade: 0 }); await sleep(800); if (!alive()) return;
+    say('スキル攻撃 — 光の騎行'); knight.play('Skill', { once: true, fade: 0.15 });
+    const dd = black.play('DieToKnightSkill', { once: true, fade: 0.15 });
+    const dying = dieCrumbling(black, dd * 0.75, (KN_SKILL.KILL / 24 * 1000) / (dd * 0.75));
+    for (const f of KN_SKILL.GUARD) { await at24(knight, f, alive); if (!alive()) return; guardFlash(ball(), 0xffe2a0); }
+    await at24(knight, KN_SKILL.KILL, alive); if (!alive()) return;
+    sparkBurst(new THREE.Vector3(0, 0.7, -0.95), 0xffe2a0); impact(new THREE.Vector3(0, 0.7, -0.95), 0.1); shockwave(new THREE.Vector3(0, 0, -0.6), 0xffe2a0);
+    await nearEnd24(knight, alive, 0.1); if (!alive()) return;
+    knight.play('Victory', { once: true, fade: 0.2 }); await dying; if (!alive()) return; await sleep(1500);
+  }
+}
+// the plain move: an empty board, the knight glides along its L and lands on the square
+async function knightLeap() {
+  const my = ++token; setActive('knightLeap');
+  const alive = () => my === token;
+  controls.autoRotate = true;
+  camera.position.set(4.6, 2.8, 2.6); controls.target.set(0.3, 0.6, 0.0);
+  const a = new THREE.Vector3(1, 0, 1), b = new THREE.Vector3(0, 0, -1);
+  while (alive()) {
+    place(); white.root.visible = false; black.root.visible = false;
+    for (const [from, to] of [[a, b], [b, a]]) {
+      knight.root.visible = true; knight.root.position.copy(from); faceToward(knight, to);
+      knight.play('Idle', { fade: 0.2 }); say('ナイトの移動 — 目標のマスへ滑空'); await sleep(1200); if (!alive()) return;
+      const d = knight.play('Leap', { once: true, fade: 0.1 }); glide(knight, to, 'Leap');
+      await sleep(d); if (!alive()) return;
+    }
+  }
+}
+// ---- lightning: a jagged, flickering bolt from the orb to the target, a travelling ball of light, a flash
+const boltMat = new THREE.LineBasicMaterial({ color: 0xbfe2ff, transparent: true, blending: THREE.AdditiveBlending, depthWrite: false });
+const boltBall = new THREE.Mesh(new THREE.SphereGeometry(0.05, 12, 8),
+  new THREE.MeshBasicMaterial({ color: 0xd8ecff, transparent: true, blending: THREE.AdditiveBlending, depthWrite: false }));
+const boltLight = new THREE.PointLight(0x8ab8ff, 0, 4, 2);
+scene.add(boltBall, boltLight); boltBall.visible = false;
+async function lightning(from, to, flightMs) {
+  const my = token, lines = [];
+  for (let k = 0; k < 3; k++) { const l = new THREE.Line(new THREE.BufferGeometry(), boltMat); scene.add(l); lines.push(l); }
+  const t0 = performance.now(), life = flightMs + 380;
+  boltBall.visible = true;
+  while (performance.now() - t0 < life && my === token) {
+    const u = Math.min(1, (performance.now() - t0) / flightMs);
+    const head = from.clone().lerp(to, u);
+    for (const [k, l] of lines.entries()) {   // re-jag every frame so it crackles
+      const pts = [], n = 14;
+      for (let i = 0; i <= n; i++) {
+        const p = from.clone().lerp(head, i / n);
+        if (i > 0 && i < n) p.add(new THREE.Vector3((Math.random() - .5), (Math.random() - .5), (Math.random() - .5)).multiplyScalar(0.09 * (k ? 0.6 : 1)));
+        pts.push(p);
+      }
+      l.geometry.setFromPoints(pts);
+    }
+    boltBall.position.copy(head); boltLight.position.copy(head);
+    boltLight.intensity = 6 * (1 - Math.max(0, (performance.now() - t0 - flightMs) / 380));
+    boltMat.opacity = 1 - Math.max(0, (performance.now() - t0 - flightMs) / 380);
+    await sleep(16);
+  }
+  lines.forEach(l => scene.remove(l)); boltBall.visible = false; boltLight.intensity = 0; boltMat.opacity = 1;
+}
+// storyboard row 3: the bishop raises the crozier, the orb gathers light, a bolt strikes the pawn from two squares
+
+// --- the bishop's spell: rune circles on the board, power gathering in a growing orb at the staff, a shot of
+//     light that flies trailing rings and bursts on the target (bishop_anims.py SPELL_FRAME / SPELL_FLIGHT)
+const SPELL = { FIRE: 48, FLIGHT: 8 };
+function runeCircle(at, radius, color, life, spin) {
+  const g = new THREE.Group(); g.position.set(at.x, 0.03, at.z); g.rotation.x = -Math.PI / 2;
+  const mats = [];
+  const add = (geo, line = false) => { const m = addMat(color, 0); mats.push(m);
+    g.add(line ? new THREE.LineLoop(geo, new THREE.LineBasicMaterial({ color, transparent: true, opacity: 0, blending: THREE.AdditiveBlending, depthWrite: false })) : new THREE.Mesh(geo, m)); };
+  add(new THREE.RingGeometry(0.95, 1, 64)); add(new THREE.RingGeometry(0.66, 0.69, 64));
+  const star = [];                                   // a seven-pointed star of runes inside the circles
+  for (let i = 0; i < 7; i++) { const a = i * 3 / 7 * Math.PI * 2; star.push(new THREE.Vector3(Math.cos(a) * 0.66, Math.sin(a) * 0.66, 0)); }
+  add(new THREE.BufferGeometry().setFromPoints(star), true);
+  for (let i = 0; i < 12; i++) {                     // rune marks between the rings
+    const m = new THREE.Mesh(new THREE.PlaneGeometry(0.05, 0.12), addMat(color, 0)); mats.push(m.material);
+    const a = i / 12 * Math.PI * 2; m.position.set(Math.cos(a) * 0.83, Math.sin(a) * 0.83, 0); m.rotation.z = a; g.add(m);
+  }
+  addFx(g, life, (g, u, dt) => {
+    g.rotation.z += spin * dt; g.scale.setScalar(radius * Math.min(1, u * 5));
+    const o = 0.85 * Math.min(1, u * 6) * (u > 0.85 ? (1 - u) / 0.15 : 1);
+    g.traverse(c => { if (c.material) c.material.opacity = o; });
+  }, false);
+}
+async function bishopSpell(alive, target) {
+  const orb = boneOf(bishop, 'orb'), a = bishop.current;
+  const f = () => a.time * 24;
+  const core = new THREE.Mesh(new THREE.SphereGeometry(1, 16, 12), addMat(0xd6e6ff, 0.95)); scene.add(core);
+  const halo = new THREE.Mesh(fxGeo.ring, addMat(0x9cc0ff, 0.8)); scene.add(halo);
+  const glowLight = new THREE.PointLight(0x9cc0ff, 0, 4, 2); scene.add(glowLight);
+  let stage = 0;
+  // gathering: the orb swells, motes stream into it, the circles open in two stages
+  while (alive() && a.isRunning() && f() < SPELL.FIRE) {
+    const k = Math.min(1, f() / 40), at = orb.getWorldPosition(new THREE.Vector3());
+    core.position.copy(at); core.scale.setScalar(0.015 + 0.07 * k * k);
+    halo.position.copy(at); halo.quaternion.copy(camera.quaternion); halo.scale.setScalar(0.04 + 0.16 * k); halo.rotateZ(f() * 0.2);
+    glowLight.position.copy(at); glowLight.intensity = 2 + 18 * k;
+    bishop.glow.emissiveIntensity = 1.2 + 7 * k;
+    if (stage === 0 && f() >= 12) { stage = 1; magicMotes(at, 0x9cc0ff, 1400); }
+    if (stage === 1 && f() >= 20) { stage = 2; runeCircle(bishop.root.position, 0.55, 0x8fb8ff, 2.4, 0.6); }
+    if (stage === 2 && f() >= 30) { stage = 3; runeCircle(bishop.root.position, 0.95, 0x8fb8ff, 1.9, -0.4);
+                                    runeCircle(bishop.root.position, 0.3, 0xcfe0ff, 1.9, 1.5); }
+    await sleep(8);
+  }
+  if (!alive()) { scene.remove(core, halo, glowLight); return; }
+  // the shot: the orb leaves the staff and flies, trailing rings, to the target
+  const from = core.position.clone(), dir = target.clone().sub(from), flight = SPELL.FLIGHT / 24;
+  const t0 = performance.now(); let lastRing = -1;
+  while (alive()) {
+    const u = Math.min(1, (performance.now() - t0) / 1000 / flight);
+    core.position.lerpVectors(from, target, u); core.scale.setScalar(0.08);
+    halo.position.copy(core.position); halo.quaternion.copy(camera.quaternion);
+    glowLight.position.copy(core.position);
+    const ring = Math.floor(u * 5);
+    if (ring !== lastRing && u < 1) {   // rings left along the path, facing the line of flight
+      lastRing = ring; const m = new THREE.Mesh(fxGeo.ring, addMat(0x9cc0ff)); m.position.copy(core.position);
+      m.lookAt(core.position.clone().add(dir)); addFx(m, 0.5, (m, v) => { m.scale.setScalar(0.08 + 0.1 * v); m.material.opacity = 0.8 * (1 - v); }, false);
+    }
+    if (u >= 1) break;
+    await sleep(8);
+  }
+  bishop.glow.emissiveIntensity = 1.2; scene.remove(core, halo, glowLight);
+  if (!alive()) return;
+  // impact: a blinding burst, a shockwave over the board, light motes and stone chips
+  sparkBurst(target, 0xfff1c8); sparkBurst(target, 0xbcd6ff); impact(target, 0.12);
+  shockwave(new THREE.Vector3(target.x, 0, target.z), 0xbcd6ff); dust(new THREE.Vector3(target.x, 0, target.z), 1.6, 12);
+  flash.position.copy(target); flash.color.set(0xfff1c8); flash.intensity = 80;
+}
+function magicMotes(at, color, ms) {   // motes drawn in from all around toward a point
+  const life = ms / 1000;
+  for (let i = 0; i < 30; i++) {
+    const m = new THREE.Mesh(fxGeo.disc, addMat(color, 0)); const d0 = new THREE.Vector3(Math.random() - .5, Math.random() - .3, Math.random() - .5).normalize().multiplyScalar(0.5 + Math.random() * 0.3);
+    const delay = Math.random() * 0.6;
+    addFx(m, life, (m, u) => { const t = Math.min(1, Math.max(0, (u * life - delay) / 0.6));
+      m.position.copy(at).addScaledVector(d0, 1 - t); m.scale.setScalar(0.018); m.material.opacity = t > 0 && t < 1 ? 0.9 : 0; });
+  }
+}
+// shared beats of the piece-vs-pawn fights (battle sheet): every blow before the last is met by a blade or shield
+const at24 = async (p, f, alive) => { const a = p.current; while (alive() && a.isRunning() && a.time < f / 24) await sleep(8); };
+const nearEnd24 = async (p, alive, lead = 0.12) => { const a = p.current; while (alive() && a.isRunning() && a.time < a.getClip().duration - lead) await sleep(8); };
+const bladePoint = (p, len) => boneOf(p, 'weapon').localToWorld(new THREE.Vector3(0, len, 0));
+// the piece's first blow is caught on the pawn's crossed daggers
+async function pieceBlocked(piece, cutLen, alive, text) {
+  say(text); piece.play('AttackBlocked', { once: true, fade: 0.15 }); black.play('Block', { once: true, fade: 0.15 });
+  await at24(piece, 16, alive); if (!alive()) return false;
+  guardFlash(bladePoint(piece, cutLen)); dust(piece.root.position, 0.8, 5);
+  await nearEnd24(piece, alive); return alive();
+}
+// the pawn answers - leaping in as far as it must - and the piece turns it aside (Block)
+async function pawnCounter(piece, extra, alive, text) {
+  say(text); black.play('AttackBlocked', { once: true, fade: 0.15 }); lungeIn(black, extra, 'AttackBlocked');
+  piece.play('Block', { once: true, fade: 0.15 });
+  await at24(black, 16, alive); if (!alive()) return false;
+  guardFlash(boneOf(black, 'weapon').localToWorld(new THREE.Vector3(0, CUT, 0))); dust(black.root.position, 0.6, 4);
+  await nearEnd24(black, alive); black.play('Ready', { fade: 0.2 }); piece.play('Idle', { fade: 0.2 });
+  await sleep(250); return alive();
+}
+async function bishopBattle() {
+  const my = ++token; setActive('bishop');
+  const alive = () => my === token;
+  controls.autoRotate = true;
+  camera.position.set(4.6, 2.4, 2.6); controls.target.set(0, 0.7, 0.3);
+  const FPS = 24, BOLT = 22, FLIGHT = 4;   // BlenderSource/bishop_anims.py
+  const orb = bishop.bones.find(b => b.name === 'orb');
+  while (alive()) {
+    place(); white.root.visible = false;
+    bishop.root.visible = true; bishop.root.position.set(0, 0, 2.2); bishop.root.rotation.y = Math.PI;
+    bishop.play('Idle', { fade: 0 }); black.play('Idle', { fade: 0 }); drawLater(black, 1000, alive);
+    say('白のビショップが前進'); await sleep(1200); if (!alive()) return;
+    await moveTo(bishop, 1.2); if (!alive()) return;
+    bishop.play('Idle'); await sleep(400); if (!alive()) return;
+    // first bolt: the pawn throws up its crossed daggers and the lightning bursts on them
+    say('ビショップの詠唱 — 黒は双剣で雷を受け止める'); bishop.play('Attack', { once: true, fade: 0.15 });
+    { const t0 = performance.now(); let blocking = false;
+      while (performance.now() - t0 < BOLT / FPS * 1000) {
+        const e = performance.now() - t0;
+        bishop.glow.emissiveIntensity = 1.2 + 6 * Math.pow(e / (BOLT / FPS * 1000), 2);
+        if (!blocking && e >= (BOLT + FLIGHT - 16) / FPS * 1000) { blocking = true; black.play('Block', { once: true, fade: 0.12 }); }
+        await sleep(16); if (!alive()) return;
+      }
+      bishop.glow.emissiveIntensity = 1.2;
+      const from = orb.getWorldPosition(new THREE.Vector3()), to = boneOf(black, 'weapon').getWorldPosition(new THREE.Vector3())
+        .add(boneOf(black, 'weapon.L').getWorldPosition(new THREE.Vector3())).multiplyScalar(0.5).add(new THREE.Vector3(0, 0.1, 0));
+      lightning(from, to, FLIGHT / FPS * 1000);
+      await sleep(FLIGHT / FPS * 1000); if (!alive()) return; guardFlash(to, 0xbfe2ff);
+      await nearEnd24(bishop, alive); if (!alive()) return;
+      bishop.play('Idle', { fade: 0.2 }); black.play('Ready', { fade: 0.2 }); await sleep(500); if (!alive()) return; }
+    say('魔法発動 — 杖を掲げ、魔力を収束'); bishop.play('Spell', { once: true, fade: 0.15 });
+    let dying = null;
+    at24(bishop, SPELL.FIRE + SPELL.FLIGHT - 16, alive).then(() => {   // the pawn's Death takes the blow on its frame 16
+      if (!alive()) return; const dd = black.play('Death', { once: true }); dying = dieCrumbling(black, dd * 0.75, 0.29); });
+    at24(bishop, 20, alive).then(() => alive() && say('魔法陣の展開 — 詠唱'));
+    at24(bishop, 40, alive).then(() => alive() && say('魔力の最大化'));
+    at24(bishop, SPELL.FIRE, alive).then(() => alive() && say('光の弾を放つ！'));
+    await bishopSpell(alive, new THREE.Vector3(0, 0.68, -1)); if (!alive()) return;
+    await nearEnd24(bishop, alive, 0.1); if (!alive()) return;
+    say('白の勝利！'); bishop.play('Victory', { once: true });
+    await (dying || sleep(0)); if (!alive()) return;
+    await sleep(2500);
+  }
+}
+// storyboard row 4: the tower wakes, stomps up to the pawn and slams into it with its whole bulk
+async function rookBattle() {
+  const my = ++token; setActive('rook');
+  const alive = () => my === token;
+  controls.autoRotate = true;
+  camera.position.set(4.2, 2.4, 2.4); controls.target.set(0, 0.7, 0.0);
+  while (alive()) {
+    place(); white.root.visible = false;
+    rook.root.visible = true; rook.root.position.set(0, 0, 2.8); rook.root.rotation.y = Math.PI;
+    rook.play('Idle', { fade: 0 }); black.play('Idle', { fade: 0 }); drawLater(black, 1000, alive);
+    say('白のルーク — 塔が目を覚ます'); await sleep(1600); if (!alive()) return;
+    // user: "攻撃するとき初めからダッシュしてタックル": the tower breaks into a run from where it stands and charges
+    // straight into the tackle - Charge carries it at the Attack's own stride pace (rook_anims ROOK_RUN_FRAMES)
+    say('ルークの突進！'); rook.play('Charge', { fade: 0.15 });
+    { const RUN = 0.5 * 0.7 / 0.34 / (16 / 24);   // |ROOK_LUNGE| in board units over the Attack's 16 run-in frames
+      let last = performance.now(), step = 0;
+      while (alive() && rook.root.position.z > 0.6) {
+        const now = performance.now(), dt = Math.min(0.05, (now - last) / 1000); last = now;
+        rook.root.position.z = Math.max(0.6, rook.root.position.z - RUN * dt);
+        if ((step += dt) > 0.33) { step = 0; dust(rook.root.position, 0.8, 4); }
+        await sleep(8);
+      }
+      if (!alive()) return; }
+    say('ルークの豪快なタックル！'); const d = rook.play('Attack', { once: true, fade: 0.06 });
+    const dd = black.play('Death', { once: true });
+    const dying = dieCrumbling(black, dd * 0.75, 0.29);
+    await at24(rook, 9, alive); dust(rook.root.position, 0.9, 5);                 // the two driving strides
+    await at24(rook, 13, alive); dust(rook.root.position.clone().add(new THREE.Vector3(0, 0, -0.3)), 0.9, 5);
+    await at24(rook, 16, alive); if (!alive()) return;
+    const at = new THREE.Vector3(0, 0.6, -0.9);
+    sparkBurst(at); impact(at, 0.14); dust(new THREE.Vector3(0, 0, -0.9), 1.6, 12);
+    await nearEnd24(rook, alive, 0); if (!alive()) return;
+    rook.root.position.z -= 1.24; rook.play('Victory', { once: true, fade: 0 });   // commit where the tackle ended
+    say('白の勝利！');
+    await dying; if (!alive()) return;
+    await sleep(2500);
+  }
+}
+// the rook's iai (rook_anims.py Iai): from 1.6 squares it sinks into a draw stance, bursts past the pawn on its
+// left and cuts it down in passing (frame 16); it ends ROOK_IAI_END = (0.75 left, 2.3 forward) from where it started
+async function rookIai() {
+  // sheet "ルーク | 居合モーション": 予備動作 -> 抜刀 -> 斬撃 (IAI_HIT, cut down in passing) -> 残心 -> 納刀 (rook_anims.py)
+  const my = ++token; setActive('rookIai');
+  const alive = () => my === token;
+  const HIT = 60;
+  controls.autoRotate = true;
+  camera.position.set(4.2, 2.4, 2.4); controls.target.set(0, 0.7, -0.4);
+  while (alive()) {
+    place(); white.root.visible = false;
+    rook.root.visible = true; rook.root.position.set(0, 0, 0.6); rook.root.rotation.y = Math.PI;
+    black.play('Idle', { fade: 0 }); drawLater(black, 400, alive);
+    say('予備動作 — 柄に手を添え、呼吸を整える'); rook.play('Iai', { once: true, fade: 0 });
+    await at24(rook, 36, alive); say('抜刀');
+    await at24(rook, 42, alive); sparkBurst(boneOf(rook, 'weapon').getWorldPosition(new THREE.Vector3()), 0xffe2a0);   // the blade leaves the scabbard
+    await at24(rook, HIT - 16, alive); if (!alive()) return;
+    const dd = black.play('DeathCut', { once: true, fade: 0.1 });
+    const dying = dieCrumbling(black, dd * 0.75, (16 / 24 * 1000) / (dd * 0.75));
+    await at24(rook, HIT - 4, alive); say('一閃！'); dust(rook.root.position, 1.0, 6);
+    await at24(rook, HIT, alive); if (!alive()) return;
+    const at = new THREE.Vector3(0, 0.68, -1.0); sparkBurst(at, 0xffe2a0); impact(at, 0.1);
+    await at24(rook, HIT + 12, alive); dust(new THREE.Vector3(-0.75, 0, -1.7), 1.2, 8);   // skids to a halt past it
+    say('残心');
+    await at24(rook, HIT + 48, alive); say('納刀');
+    await nearEnd24(rook, alive, 0); if (!alive()) return;
+    say('白の勝利！');
+    await dying; if (!alive()) return;
+    await sleep(2000);
+  }
+}
+// the queen's light (queen_anims.py Q_*): pillars of light that fall from the sky, and spears that rain down
+const Q = { COMBO: [8, 13, 18, 23, 28, 34, 40, 46, 52, 58], CIRCLE: 26, PILLARS: 40, BURST: 60, SPEARS: 40, PIERCE: 46 };
+function lightPillar(at, delay = 0, color = 0xfff0c8) {
+  const m = new THREE.Mesh(new THREE.CylinderGeometry(0.09, 0.09, 4, 12, 1, true), addMat(color, 0));
+  m.position.set(at.x, 2, at.z);
+  addFx(m, 0.9 + delay, (m, u, dt) => { const t = u * (0.9 + delay) - delay; if (t < 0) return;
+    const k = t / 0.9; m.scale.set(1 + k * 1.5, Math.min(1, k * 6), 1 + k * 1.5); m.position.y = 4 - 2 * Math.min(1, k * 6);
+    m.material.opacity = 0.8 * (1 - k); }, false);
+  setTimeout(() => { dust(new THREE.Vector3(at.x, 0, at.z), 0.7, 4); sparkBurst(new THREE.Vector3(at.x, 0.05, at.z), color); }, delay * 1000 + 150);
+}
+function lightSpear(to, delay = 0, color = 0xd8c8ff) {
+  const m = new THREE.Mesh(new THREE.ConeGeometry(0.035, 0.55, 8), addMat(color, 0));
+  const from = to.clone().add(new THREE.Vector3((Math.random() - 0.5) * 1.2, 3.2, (Math.random() - 0.5) * 1.2));
+  m.quaternion.setFromUnitVectors(new THREE.Vector3(0, -1, 0), to.clone().sub(from).normalize());
+  addFx(m, 0.45 + delay, (m, u) => { const t = u * (0.45 + delay) - delay; if (t < 0) { m.material.opacity = 0; return; }
+    const k = Math.min(1, t / 0.3); m.position.lerpVectors(from, to, k); m.material.opacity = k < 1 ? 1 : Math.max(0, 1 - (t - 0.3) / 0.15); }, false);
+}
+// the queen does not fight (user: "クイーンに戦闘モーションはいらない / 派手な魔法で一掃してほしい"): she glides in, chants,
+// and sweeps a whole rank of pawns away - 光の裁き (pillars of light on every pawn, the burst) then 女王の審判
+// (a cosmic circle and a rain of light spears that pierces them all)
+async function queenBattle() {
+  const my = ++token; setActive('queen');
+  const alive = () => my === token;
+  controls.autoRotate = true;
+  camera.position.set(4.8, 3.2, 3.0); controls.target.set(0, 0.8, -0.4);
+  const orbAt = () => boneOf(queen, 'weapon').localToWorld(new THREE.Vector3(0, 0.89, 0));
+  const foes = [black, black2, black3], spots = [new THREE.Vector3(0, 0, -1), new THREE.Vector3(-1, 0, -1.4), new THREE.Vector3(1, 0, -1.4)];
+  while (alive()) {
+    place(); white.root.visible = false;
+    for (const [i, p] of foes.entries()) { p.root.visible = true; p.root.position.copy(spots[i]); p.root.rotation.y = 0; p.setCrumble(0); p.play('Idle', { fade: 0 }); drawLater(p, 900 + i * 250, alive); }
+    queen.root.visible = true; queen.root.position.set(0, 0, 2.0); queen.root.rotation.y = Math.PI;
+    queen.play('Idle', { fade: 0 });
+    say('白のクイーンが進み出る — 黒のポーンが三体'); await sleep(900); if (!alive()) return;
+    await moveTo(queen, 0.6); if (!alive()) return;
+    say('詠唱 — 魔法陣の展開'); queen.play('Chant', { once: true, fade: 0.15 });
+    await at24(queen, 12, alive); magicMotes(orbAt(), 0xd8c8ff, 1200); if (queen.glow) queen.glow.emissiveIntensity = 5;
+    await at24(queen, Q.CIRCLE, alive); runeCircle(queen.root.position, 0.6, 0xc9a6ff, 1.6, 0.8); runeCircle(queen.root.position, 0.35, 0xe8dcff, 1.6, -1.2);
+    await nearEnd24(queen, alive, 0.1); if (!alive()) return;
+    say('光の裁き'); queen.play('Skill', { once: true, fade: 0.15 });
+    await at24(queen, 16, alive); runeCircle(queen.root.position, 1.2, 0xfff0c8, 2.6, 0.5);
+    await at24(queen, 28, alive); for (const sp of spots) magicMotes(sp.clone().setY(1.6), 0xfff0c8, 1000);
+    await at24(queen, Q.PILLARS - 2, alive); if (!alive()) return;
+    for (const [k, sp] of spots.entries()) {
+      runeCircle(sp, 0.6, 0xfff0c8, 1.8, k % 2 ? 0.7 : -0.7);
+      for (let i = 0; i < 6; i++) { const a = i / 6 * Math.PI * 2; lightPillar(sp.clone().add(new THREE.Vector3(Math.cos(a) * 0.55, 0, Math.sin(a) * 0.55)), i * 0.06 + k * 0.1); }
+    }
+    await at24(queen, Q.BURST - 16, alive); for (const p of foes) p.play('Hit', { once: true, fade: 0.12 });   // driven to their knees
+    await at24(queen, Q.BURST, alive); if (!alive()) return;
+    for (const sp of spots) { lightPillar(sp); sparkBurst(sp.clone().setY(0.75), 0xfff0c8); }
+    shockwave(spots[0].clone(), 0xfff0c8); impact(spots[0].clone().setY(0.75), 0.12);
+    await nearEnd24(queen, alive, 0.2); if (!alive()) return;
+    say('必殺技 — 女王の審判'); queen.play('Ultimate', { once: true, fade: 0.15 });
+    await at24(queen, 14, alive); runeCircle(queen.root.position.clone(), 1.6, 0xc9a6ff, 3.0, 0.3);
+    await at24(queen, 24, alive); { const sky = new THREE.Vector3(0, 2.8, -1.1); runeCircle(sky, 1.4, 0xe8dcff, 2.2, -0.6); magicMotes(sky, 0xe8dcff, 1400); }
+    await at24(queen, Q.PIERCE - 16, alive); if (!alive()) return;
+    const dying = foes.map((p, i) => { const dd = p.play('Death', { once: true, fade: 0.12 }); return dieCrumbling(p, dd * 0.75, 0.29); });
+    await at24(queen, Q.SPEARS, alive); if (!alive()) return;
+    for (const sp of spots) {
+      for (let i = 0; i < 9; i++) { const a = Math.random() * Math.PI * 2, r = 0.25 + Math.random() * 0.6;
+        lightSpear(sp.clone().add(new THREE.Vector3(Math.cos(a) * r, 0.02, Math.sin(a) * r)), i * 0.04); }
+      lightSpear(sp.clone().add(new THREE.Vector3(0, 0.72, 0.05)), 0.05, 0xfff0c8);   // the spear that pierces each pawn
+    }
+    await at24(queen, Q.PIERCE, alive); if (!alive()) return;
+    for (const sp of spots) sparkBurst(sp.clone().setY(0.72), 0xfff0c8); impact(spots[0].clone().setY(0.72), 0.14);
+    await at24(queen, 56, alive);
+    for (const sp of spots) { lightPillar(sp, 0, 0xffffff); shockwave(sp.clone(), 0xe8dcff); }
+    if (queen.glow) queen.glow.emissiveIntensity = 1.2;
+    await nearEnd24(queen, alive, 0.1); if (!alive()) return;
+    say('一掃 — 白の勝利！'); queen.play('Victory', { once: true, fade: 0.2 });
+    await Promise.all(dying); if (!alive()) return;
+    await sleep(2500);
+  }
+}
+// the king's special: a golden shockwave rings out across the board where the greatsword bites it
+let waves = [];
+function shockwave(at, color = 0xffd27a) {
+  for (let i = 0; i < 2; i++) {
+    const m = new THREE.Mesh(new THREE.RingGeometry(0.85, 1, 64),
+      new THREE.MeshBasicMaterial({ color, transparent: true, blending: THREE.AdditiveBlending, depthWrite: false, side: THREE.DoubleSide }));
+    m.rotation.x = -Math.PI / 2; m.position.copy(at); m.position.y = 0.02 + i * 0.005;
+    m.userData = { age: -i * 0.12, life: 0.9 }; m.scale.setScalar(0.01); scene.add(m); waves.push(m);
+  }
+  flash.position.copy(at).setY(0.5); flash.color.set(0xffc860); flash.intensity = 60;
+}
+function stepWaves(dt) {
+  for (const m of waves) {
+    const u = m.userData; u.age += dt; const k = Math.max(0, u.age / u.life);
+    m.scale.setScalar(0.01 + 2.6 * Math.sqrt(k)); m.material.opacity = u.age < 0 ? 0 : Math.max(0, 1 - k) * 0.9;
+  }
+  waves = waves.filter(m => m.userData.age < m.userData.life || (scene.remove(m), false));
+}
+// storyboard row 6: the king raises the greatsword over his crown and cleaves the pawn down into the board
+async function kingBattle() {
+  const my = ++token; setActive('king');
+  const alive = () => my === token;
+  controls.autoRotate = true;
+  camera.position.set(4.6, 2.8, 2.4); controls.target.set(0, 0.8, 0.2);
+  while (alive()) {
+    place(); white.root.visible = false;
+    king.root.visible = true; king.root.position.set(0, 0, 2.0); king.root.rotation.y = Math.PI;
+    king.play('Idle', { fade: 0 }); black.play('Idle', { fade: 0 }); drawLater(black, 1000, alive);
+    say('白のキングが歩み出る'); await sleep(1300); if (!alive()) return;
+    await moveTo(king, 0.65); if (!alive()) return;   // 1.65 squares (king_anims KING_DUEL_BLOCK)
+    king.play('Idle'); await sleep(300); if (!alive()) return;
+    if (!await pieceBlocked(king, 0.945, alive, 'キングの剣 — 黒は双剣で受け止める')) return;
+    if (!await pawnCounter(king, 0.65, alive, '黒の反撃 — キングが盾で受ける')) return;
+    await moveTo(king, 0.0); if (!alive()) return;
+    king.play('Idle', { fade: 0.15 }); await sleep(200); if (!alive()) return;
+    say('王の一撃！'); const d = king.play('Attack', { once: true });
+    const dd = black.play('Death', { once: true });
+    const dying = dieCrumbling(black, dd * 0.75, 0.29);
+    await sleep(667); if (!alive()) return;   // frame 16: through the chest
+    const at = new THREE.Vector3(0, 0.75, -0.95); sparkBurst(at); impact(at, 0.08);
+    await sleep(125); if (!alive()) return;   // frame 19 (KING_SLAM_FRAME): the blade bites the board
+    shockwave(new THREE.Vector3(0, 0, -1.0)); impact(new THREE.Vector3(0, 0.05, -1.0), 0.2);
+    await sleep(d - 792 + 200); if (!alive()) return;
+    say('白の勝利！'); king.play('Victory', { once: true });
+    await dying; if (!alive()) return;
+    await sleep(2500);
+  }
+}
+async function showClip(name) {
+  ++token; setActive(name);
+  const [type, clip] = name.includes(':') ? name.split(':') : ['Pawn', name];
+  const p = type === 'Knight' ? knight : type === 'Bishop' ? bishop : type === 'Rook' ? rook : type === 'Queen' ? queen : type === 'King' ? king : white;
+  place(); white.root.visible = p === white; knight.root.visible = p === knight; bishop.root.visible = p === bishop; rook.root.visible = p === rook; queen.root.visible = p === queen; king.root.visible = p === king;
+  p.root.position.set(0, 0, 0.5); p.root.rotation.y = 0.6;
+  black.root.position.set(0, 0, -30);
+  say(`白${type === 'Knight' ? 'ナイト' : 'ポーン'}：${clip}`);
+  const d = p.play(clip, { once: !['Idle', 'Walk'].includes(clip), fade: 0.1 });
+  if (clip === 'Death') dieCrumbling(p, d * 0.75, 0.29);
+}
+
+// ---------- UI
+const btns = document.getElementById('buttons');
+const labels = { battle: 'ポーン戦', knight: 'ナイト戦', bishop: 'ビショップ戦', rook: 'ルーク戦', queen: 'クイーン戦', king: 'キング戦', knightLeap: 'ナイト跳躍', knightGlide: 'ナイト滑空攻撃', knightSkill: 'ナイトスキル', rookIai: 'ルーク居合', 'King:Attack': 'キング攻撃', 'King:Victory': 'キング勝利', 'Rook:Walk': 'ルーク歩行', 'Bishop:Attack': 'ビショップ詠唱', 'Knight:Idle': 'ナイト待機', 'Knight:Walk': 'ナイト歩行',
+  'Knight:Attack': 'ナイト突進', 'Knight:Victory': 'ナイト勝利', 'Knight:Death': 'ナイト死亡', Idle: '待機', Walk: '歩行', Draw: '抜刀', Ready: '構え', Attack: '二連斬り', AttackBlocked: '攻撃(受けられる)', Clash: '斬り合い', Dodge: '回避', Combo: '通常コンボ', Heavy: '重攻撃', Rush: 'ラッシュ', Counter: 'カウンター', Block: '防御', Hit: 'ダメージ', Death: '死亡', Victory: '勝利' };
+function setActive(k) { for (const b of btns.children) b.classList.toggle('on', b.dataset.k === k); }
+for (const k of Object.keys(labels)) {
+  const b = document.createElement('button'); b.textContent = labels[k]; b.dataset.k = k;
+  b.onclick = () => k === 'battle' ? battle() : k === 'knight' ? knightBattle() : k === 'bishop' ? bishopBattle() : k === 'rook' ? rookBattle() : k === 'queen' ? queenBattle() : k === 'king' ? kingBattle() : k === 'knightLeap' ? knightLeap() : k === 'knightGlide' ? knightGlide() : k === 'knightSkill' ? knightSkill() : k === 'rookIai' ? rookIai() : showClip(k);
+  btns.appendChild(b);
+}
+window.preview = { knightGlide, rookIai, knightLeap, kingBattle, king, queenBattle, queen, battle, knightBattle, bishopBattle, rookBattle, rook, bishop, knight, showClip, white, black, gltf,   // debug handles
+  cam: ([x, y, z], [tx, ty, tz] = [0, 0.6, -0.5]) => { controls.autoRotate = false; camera.position.set(x, y, z); controls.target.set(tx, ty, tz); controls.update(); },
+  fxCount: () => fx.length,
+  freeze: (on = true) => { fxScale = on ? 0 : 1; for (const p of [white, black, knight, bishop, rook, queen, king]) p.mixer.timeScale = on ? 0 : 1; } };
+
+// ---------- loop
+const clock = new THREE.Clock();
+renderer.setAnimationLoop(() => {
+  const dt = Math.min(clock.getDelta(), 0.05), t = clock.elapsedTime;
+  for (const p of [white, black, black2, black3, knight, bishop, rook, queen, king]) { p.mixer.update(dt); stepWalk(p, dt); stepWalkV(p, dt); stepGlide(p); } for (const q of [white, black, queen, king, knight, rook]) stepTrails(q, dt); stepFx(dt); stepLunge(black); stepRubble(dt); stepSparks(dt); stepWaves(dt);
+  candles.forEach((l, i) => l.intensity = 5 * (1 + Math.sin(t * 9 + i * 2) * 0.12 + Math.sin(t * 23 + i) * 0.07));
+  skyUniforms.uTime.value = t; arenaTime.value = t;
+  controls.update();
+  if (shake > 0.001) {   // decaying camera kick
+    camera.position.x += (Math.random() - 0.5) * shake; camera.position.y += (Math.random() - 0.5) * shake;
+    shake *= Math.pow(0.02, dt);
+  }
+  renderer.render(scene, camera);
+});
+addEventListener('resize', () => {
+  camera.aspect = innerWidth / innerHeight; camera.updateProjectionMatrix(); renderer.setSize(innerWidth, innerHeight);
+});
+battle();
+</script>
+</body>
+</html>
