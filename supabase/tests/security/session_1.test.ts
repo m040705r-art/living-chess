@@ -9,6 +9,15 @@ const URL_ = process.env.SB_URL ?? "http://127.0.0.1:54321";
 const KEY = process.env.SB_KEY ?? "sb_publishable_ACJWlzQHlZjBrEguHvfOxg_3BJgxAaH";
 const b64 = (o: unknown) => Buffer.from(JSON.stringify(o)).toString("base64url");
 const fails: string[] = [];
+// A 5xx from the local edge runtime under load (502/503/504/546) is an upstream hiccup, not the function
+// accepting a forgery — retry it so a transient error is never misread as an identity bypass.
+const TRANSIENT = new Set([502, 503, 504, 546]);
+const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
+async function settle<T extends { status: number }>(send: () => Promise<T>, tries = 5): Promise<T> {
+  let r = await send();
+  for (let i = 0; i < tries && TRANSIENT.has(r.status); i++) { await sleep(300 * (i + 1)); r = await send(); }
+  return r;
+}
 // An identity attack is BLOCKED iff the function denied it: 401/403 (or at worst a non-200 that is not a game view).
 const blocked = (name: string, status: number, body: any) => {
   const ok = (status === 401 || status === 403) && !(body && body.id) && body?.you === undefined;
@@ -33,27 +42,33 @@ const claims = (over: Record<string, unknown> = {}) =>
 // 0) baseline: a *real* anon token is accepted (so a "blocked" result below means the control works, not that the fn is down)
 {
   const t = await anon();
-  const r = await call(t, { action: "create", color: "white" });
+  const r = await settle(() => call(t, { action: "create", color: "white" }));
   console.log(`ok   baseline real-token create status=${r.status}`);
   if (r.status !== 200 || !r.body?.id) fails.push(`baseline real anon token did NOT work (status=${r.status}) — test harness/stack problem`);
 }
 
 // 1) no Authorization header at all
-blocked("no-auth-header (apikey only)", ...Object.values(await raw({ apikey: KEY })) as [number, any]);
+blocked("no-auth-header (apikey only)", ...Object.values(await settle(() => raw({ apikey: KEY }))) as [number, any]);
 // 2) no auth and no apikey
-blocked("no-auth-no-apikey", ...Object.values(await raw({})) as [number, any]);
+blocked("no-auth-no-apikey", ...Object.values(await settle(() => raw({}))) as [number, any]);
 // 3) publishable key used AS a bearer token (common confusion / "it's a key, right?")
-{ const r = await call(KEY, { action: "create" }); blocked("publishable-key-as-bearer", r.status, r.body); }
+{ const r = await settle(() => call(KEY, { action: "create" })); blocked("publishable-key-as-bearer", r.status, r.body); }
 // 4) the apikey header carries the publishable key but bearer is the publishable key too
-blocked("publishable-both-headers", ...Object.values(await raw({ apikey: KEY, Authorization: `Bearer ${KEY}` })) as [number, any]);
+blocked("publishable-both-headers", ...Object.values(await settle(() => raw({ apikey: KEY, Authorization: `Bearer ${KEY}` }))) as [number, any]);
 // 5) structurally-garbage bearer
-{ const r = await call("not.a.jwt", { action: "create" }); blocked("garbage-bearer", r.status, r.body); }
+{ const r = await settle(() => call("not.a.jwt", { action: "create" })); blocked("garbage-bearer", r.status, r.body); }
 
-// 6) tampered signature on an otherwise real token
+// 6) tampered signature on an otherwise real token.
+//    NB: flip a BYTE of the decoded signature, not the last base64url char. For a 64-byte ES256 signature the
+//    final base64url char carries only 2 significant bits (the low 4 are padding), so swapping A<->B there is a
+//    no-op that leaves the signature valid — a flaky "exploit". XOR-ing the first signature byte always changes it.
 {
   const real = await anon();
-  const tampered = real.slice(0, -1) + (real.endsWith("A") ? "B" : "A");
-  const r = await call(tampered, { action: "create" });
+  const [h, p, s] = real.split(".");
+  const sig = Buffer.from(s, "base64url");
+  sig[0] ^= 0xff;
+  const tampered = `${h}.${p}.${sig.toString("base64url")}`;
+  const r = await settle(() => call(tampered, { action: "create" }));
   blocked("tampered-signature", r.status, r.body);
 }
 // 7) tampered payload: take real header+sig but swap in a chosen sub (impersonate another uid) — sig no longer matches
@@ -61,19 +76,19 @@ blocked("publishable-both-headers", ...Object.values(await raw({ apikey: KEY, Au
   const real = await anon();
   const [h, , s] = real.split(".");
   const forged = `${h}.${claims({ sub: "11111111-1111-4111-8111-111111111111" })}.${s}`;
-  const r = await call(forged, { action: "create" });
+  const r = await settle(() => call(forged, { action: "create" }));
   blocked("tampered-payload-sub", r.status, r.body);
 }
 // 8) alg=none forgery (classic JWT bypass)
-{ const r = await call(`${header("none")}.${claims()}.`, { action: "create" }); blocked("alg-none", r.status, r.body); }
+{ const r = await settle(() => call(`${header("none")}.${claims()}.`, { action: "create" })); blocked("alg-none", r.status, r.body); }
 // 9) alg=none with empty-but-present signature variant
-{ const r = await call(`${b64({ alg: "none", typ: "JWT" })}.${claims()}.AAAA`, { action: "create" }); blocked("alg-none-fakesig", r.status, r.body); }
+{ const r = await settle(() => call(`${b64({ alg: "none", typ: "JWT" })}.${claims()}.AAAA`, { action: "create" })); blocked("alg-none-fakesig", r.status, r.body); }
 // 10) HS256 forgery signed with the PUBLIC publishable key as if it were the secret (alg-confusion attempt)
 {
   const crypto = await import("node:crypto");
   const data = `${b64({ alg: "HS256", typ: "JWT" })}.${claims()}`;
   const sig = crypto.createHmac("sha256", KEY).update(data).digest("base64url");
-  const r = await call(`${data}.${sig}`, { action: "create" });
+  const r = await settle(() => call(`${data}.${sig}`, { action: "create" }));
   blocked("hs256-alg-confusion", r.status, r.body);
 }
 // 11) "another project" / foreign-issuer token: real ES256 structure but signed by a key we generated ourselves
@@ -82,7 +97,7 @@ blocked("publishable-both-headers", ...Object.values(await raw({ apikey: KEY, Au
   const { privateKey } = crypto.generateKeyPairSync("ec", { namedCurve: "P-256" });
   const data = `${header("ES256")}.${claims()}`;
   const sig = crypto.sign("sha256", Buffer.from(data), { key: privateKey, dsaEncoding: "ieee-p1363" }).toString("base64url");
-  const r = await call(`${data}.${sig}`, { action: "create" });
+  const r = await settle(() => call(`${data}.${sig}`, { action: "create" }));
   blocked("foreign-es256-key", r.status, r.body);
 }
 // 12) expired-shaped token (past exp). Cannot sign a genuine expired token without the secret, so this doubles as a
@@ -90,7 +105,7 @@ blocked("publishable-both-headers", ...Object.values(await raw({ apikey: KEY, Au
 {
   const real = await anon();
   const [h, , s] = real.split(".");
-  const r = await call(`${h}.${claims({ exp: now - 10, iat: now - 3610 })}.${s}`, { action: "create" });
+  const r = await settle(() => call(`${h}.${claims({ exp: now - 10, iat: now - 3610 })}.${s}`, { action: "create" }));
   blocked("expired-shaped", r.status, r.body);
 }
 
