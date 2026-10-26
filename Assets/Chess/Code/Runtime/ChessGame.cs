@@ -467,6 +467,9 @@ public class ChessGame : MonoBehaviour
 
     // ---------------------------------------------------------------- camera
     float yaw, yawOffset, zoom = 1f;
+    bool watchAngle = true;   // when a move plays: true = swing to the angled battle view, false = stay overhead
+    float camT;               // 0 = angled view, 1 = top-down (overhead); lerps toward the target each frame
+    Camera cam;
 
     void CameraControl()
     {
@@ -489,6 +492,19 @@ public class ChessGame : MonoBehaviour
         yaw = mode == Mode.Menu ? target : Mathf.LerpAngle(yaw, target + yawOffset, Time.deltaTime * 3f);
         cameraPivot.rotation = Quaternion.Euler(0, yaw, 0);
         cameraPivot.localScale = Vector3.one * zoom;
+
+        // Overhead while choosing a move (easy to read every piece's options from straight above); during a
+        // move, drop to the angled view to watch the battle only if the player chose "斜め". Menu stays angled.
+        if (!cam) cam = cameraPivot.GetComponentInChildren<Camera>();
+        float tTarget = mode == Mode.Menu ? 0f : (busy && watchAngle) ? 0f : 1f;
+        camT = Mathf.MoveTowards(camT, tTarget, Time.deltaTime * 2.4f);
+        if (cam)
+        {
+            var lp = Vector3.Lerp(new Vector3(0, 9.5f, -9.5f), new Vector3(0, 14f, -0.7f), camT);
+            var lt = Vector3.Lerp(new Vector3(0, 0, 0.4f), Vector3.zero, camT);
+            cam.transform.localPosition = lp;
+            cam.transform.localRotation = Quaternion.LookRotation((lt - lp).normalized, Vector3.up);
+        }
     }
 
     // a tall phone screen: widen the view so the whole board still fits across
@@ -504,7 +520,7 @@ public class ChessGame : MonoBehaviour
     float UiScale => Mathf.Max(1f, Mathf.Min(Screen.width, Screen.height) / 720f);
     float VW => Screen.width / UiScale;
     float VH => Screen.height / UiScale;
-    Rect hud = new Rect(16, 16, 330, 190);
+    Rect hud = new Rect(16, 16, 330, 240);
     GUIStyle big, mid, btn;
     Font uiFont;   // Japanese-capable font (WebGL's built-in font has no CJK glyphs), loaded from Resources
 
@@ -562,6 +578,8 @@ public class ChessGame : MonoBehaviour
         GUILayout.BeginArea(new Rect(hud.x + 12, hud.y + 10, hud.width - 24, hud.height - 20));
         GUILayout.Label(StatusText(), mid);
         GUILayout.FlexibleSpace();
+        // choose what happens to the camera while a move plays out
+        if (GUILayout.Button(watchAngle ? "動くとき: 斜めから見る" : "動くとき: 真上のまま", btn)) watchAngle = !watchAngle;
         GUILayout.BeginHorizontal();
         if (mode == Mode.Online)
         {
