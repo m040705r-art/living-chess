@@ -15,7 +15,7 @@ public class ChessGame : MonoBehaviour
     public PawnBattle fx;
     public Transform cameraPivot;
 
-    enum Mode { Menu, VsCpu, TwoPlayers }
+    enum Mode { Menu, VsCpu, TwoPlayers, Online }
     Mode mode = Mode.Menu;
     int humanSide = 1, level = 1;
     static readonly string[] LevelNames = { "やさしい", "ふつう", "つよい" };
@@ -76,6 +76,7 @@ public class ChessGame : MonoBehaviour
     void NewGame()
     {
         StopAllCoroutines();
+        netResult = ""; netSending = false; netFetching = false;
         busy = false; thinking = null; selected = -1; promoChoices = null; lastMove = null;
         rules.Reset();
         result = ChessRules.Result.Playing;
@@ -108,11 +109,14 @@ public class ChessGame : MonoBehaviour
 
     // ---------------------------------------------------------------- turn flow
     bool CpuTurn => mode == Mode.VsCpu && rules.side != humanSide;
+    // online: the server holds the game; this board only shows it and sends this player's moves
+    bool MyOnlineTurn => mode != Mode.Online || (netJoined && !netSending && rules.side == humanSide);
 
     void Update()
     {
         CameraControl();
-        if (mode == Mode.Menu || busy || result != ChessRules.Result.Playing) return;
+        if (mode == Mode.Online) OnlinePoll();
+        if (mode == Mode.Menu || busy || result != ChessRules.Result.Playing || !string.IsNullOrEmpty(netResult)) return;
         if (CpuTurn)
         {
             if (thinking == null)
@@ -133,7 +137,7 @@ public class ChessGame : MonoBehaviour
             }
             return;
         }
-        if (promoChoices != null) return;
+        if (promoChoices != null || !MyOnlineTurn) return;
         if (Input.touchCount > 1) return;   // two fingers move the camera, never a piece
         if (Input.GetMouseButtonDown(0) && !OverHud(Input.mousePosition)) Click();   // a tap arrives as a click
     }
@@ -154,7 +158,7 @@ public class ChessGame : MonoBehaviour
         var options = selMoves.FindAll(m => m.to == s);
         if (options.Count == 0) { Select(-1); return; }
         if (options.Count > 1) { promoChoices = options; return; }   // a promotion: the player picks the piece
-        StartCoroutine(PlayMove(options[0]));
+        Commit(options[0]);
     }
 
     void Select(int s)
@@ -434,6 +438,7 @@ public class ChessGame : MonoBehaviour
         float target;
         if (mode == Mode.Menu) target = yaw + 6f * Time.deltaTime;   // a slow turn round the arena behind the menu
         else if (mode == Mode.VsCpu) target = humanSide == 1 ? 0 : 180;
+        else if (mode == Mode.Online) target = humanSide == 1 ? 0 : 180;
         else target = rules.side == 1 ? 0 : 180;   // two players: the board turns to whoever is to move
         if (Input.GetMouseButton(1)) yawOffset += Input.GetAxis("Mouse X") * 4f;
         zoom = Mathf.Clamp(zoom - Input.mouseScrollDelta.y * 0.06f, 0.55f, 1.4f);
@@ -488,7 +493,7 @@ public class ChessGame : MonoBehaviour
         GUI.matrix = Matrix4x4.Scale(new Vector3(UiScale, UiScale, 1));
         if (mode == Mode.Menu)
         {
-            var r = new Rect(VW / 2f - 220, VH / 2f - 200, 440, 400);
+            var r = new Rect(VW / 2f - 220, VH / 2f - (onlinePanel ? 330 : 230), 440, 460);
             GUI.Box(r, "");
             GUILayout.BeginArea(new Rect(r.x + 20, r.y + 16, r.width - 40, r.height - 32));
             GUILayout.Label("Living Chess", big);
@@ -499,7 +504,10 @@ public class ChessGame : MonoBehaviour
             if (GUILayout.Button("CPU と対戦（白で指す）", btn)) Begin(Mode.VsCpu, 1);
             if (GUILayout.Button("CPU と対戦（黒で指す）", btn)) Begin(Mode.VsCpu, -1);
             if (GUILayout.Button("2人で対戦", btn)) Begin(Mode.TwoPlayers, 1);
+            GUILayout.Space(8);
+            if (GUILayout.Button("オンライン対戦", btn)) { onlinePanel = !onlinePanel; netError = ""; }
             GUILayout.EndArea();
+            if (onlinePanel) OnlinePanel(new Rect(r.x, r.yMax + 10, r.width, 230));
             return;
         }
         GUI.Box(hud, "");
@@ -507,8 +515,12 @@ public class ChessGame : MonoBehaviour
         GUILayout.Label(StatusText(), mid);
         GUILayout.FlexibleSpace();
         GUILayout.BeginHorizontal();
-        if (GUILayout.Button("最初から", btn)) { NewGame(); yawOffset = 0; }
-        if (GUILayout.Button("メニュー", btn)) { NewGame(); mode = Mode.Menu; }
+        if (mode == Mode.Online)
+        {
+            if (netJoined && result == ChessRules.Result.Playing && string.IsNullOrEmpty(netResult) && GUILayout.Button("投了", btn)) StartCoroutine(SendResign());
+        }
+        else if (GUILayout.Button("最初から", btn)) { NewGame(); yawOffset = 0; }
+        if (GUILayout.Button("メニュー", btn)) { NewGame(); mode = Mode.Menu; netGame = null; }
         GUILayout.EndHorizontal();
         GUILayout.EndArea();
 
@@ -520,11 +532,11 @@ public class ChessGame : MonoBehaviour
             GUILayout.Label("昇格する駒を選んでください", mid);
             GUILayout.BeginHorizontal();
             foreach (var (name, t) in new[] { ("クイーン", ChessRules.Queen), ("ルーク", ChessRules.Rook), ("ビショップ", ChessRules.Bishop), ("ナイト", ChessRules.Knight) })
-                if (GUILayout.Button(name, btn)) { var m = promoChoices.Find(x => Mathf.Abs(x.promo) == t); StartCoroutine(PlayMove(m)); }
+                if (GUILayout.Button(name, btn)) { var m = promoChoices.Find(x => Mathf.Abs(x.promo) == t); Commit(m); }
             GUILayout.EndHorizontal();
             GUILayout.EndArea();
         }
-        if (result != ChessRules.Result.Playing && !busy)
+        if ((result != ChessRules.Result.Playing || !string.IsNullOrEmpty(netResult)) && !busy)
             GUI.Label(new Rect(0, VH * 0.12f, VW, 60), ResultText(), big);
     }
 
@@ -538,16 +550,187 @@ public class ChessGame : MonoBehaviour
     string StatusText()
     {
         string who = rules.side == 1 ? "白" : "黒";
-        string vs = mode == Mode.VsCpu ? $"CPU（{LevelNames[level]}）と対戦 / あなたは{(humanSide == 1 ? "白" : "黒")}" : "2人で対戦";
-        if (result != ChessRules.Result.Playing) return vs + "\n" + ResultText();
+        string vs = mode == Mode.VsCpu ? $"CPU（{LevelNames[level]}）と対戦 / あなたは{(humanSide == 1 ? "白" : "黒")}"
+                  : mode == Mode.Online ? $"オンライン対戦 / あなたは{(humanSide == 1 ? "白" : "黒")}" : "2人で対戦";
+        if (mode == Mode.Online && !string.IsNullOrEmpty(netError)) vs += "\n" + netError;
+        if (mode == Mode.Online && !netJoined) return vs + $"\nルームコード: {netCode}\n相手の参加を待っています…";
+        if (result != ChessRules.Result.Playing || !string.IsNullOrEmpty(netResult)) return vs + "\n" + ResultText();
         string s = vs + $"\n{rules.fullmove}手目　{who}の番";
         if (CpuTurn) s += "（CPU が考え中…）";
+        if (mode == Mode.Online && rules.side != humanSide) s += "（相手の番）";
         if (rules.InCheck(rules.side)) s += "\nチェック！";
         return s;
     }
 
+    // ---------------------------------------------------------------- online (room codes; supabase/functions/game)
+    OnlineClient net;
+    bool onlinePanel, netJoined, netSending, netFetching;
+    string netGame, netCode = "", netError = "", netResult = "", codeInput = "";
+    int netVersion, netApplied;
+    float nextPoll;
+
+    static string NetErrorText(string e)
+    {
+        switch (e)
+        {
+            case "no_room": return "その部屋は見つからないか、もう始まっています";
+            case "too_many_rooms": return "部屋を作りすぎです。しばらく待ってください";
+            case "slow_down": return "操作が速すぎます。少し待ってください";
+            case "illegal": return "その手は指せません";
+            case "not_your_turn": case "stale": return "盤面を最新にしました";
+            case "network": return "通信できませんでした";
+            case "auth": return "ログインできませんでした";
+            default: return "エラー（" + e + "）";
+        }
+    }
+
+    void OnlinePanel(Rect r)
+    {
+        GUI.Box(r, "");
+        GUILayout.BeginArea(new Rect(r.x + 20, r.y + 12, r.width - 40, r.height - 24));
+        if (net == null) net = new OnlineClient();
+        if (!net.Ready) { GUILayout.Label("オンライン対戦の接続先が設定されていません", mid); GUILayout.EndArea(); return; }
+        GUILayout.Label("部屋を作る（色を選ぶ）", mid);
+        GUILayout.BeginHorizontal();
+        if (GUILayout.Button("白", btn)) StartCoroutine(CreateRoom("white"));
+        if (GUILayout.Button("黒", btn)) StartCoroutine(CreateRoom("black"));
+        if (GUILayout.Button("おまかせ", btn)) StartCoroutine(CreateRoom("random"));
+        GUILayout.EndHorizontal();
+        GUILayout.Label("ルームコードで参加", mid);
+        GUILayout.BeginHorizontal();
+        var field = new GUIStyle(GUI.skin.textField) { fontSize = 22, fixedHeight = 40 };
+        codeInput = GUILayout.TextField(codeInput, 6, field, GUILayout.Width(170)).ToUpperInvariant();
+        if (GUILayout.Button("参加", btn)) StartCoroutine(JoinRoom(codeInput.Trim()));
+        GUILayout.EndHorizontal();
+        if (!string.IsNullOrEmpty(netError)) GUILayout.Label(netError, mid);
+        GUILayout.EndArea();
+    }
+
+    IEnumerator CreateRoom(string color)
+    {
+        netError = "通信中…";
+        OnlineClient.GameView v = null;
+        yield return net.Create(color, x => v = x);
+        if (!string.IsNullOrEmpty(v.error)) { netError = NetErrorText(v.error); yield break; }
+        StartOnline(v);
+    }
+
+    IEnumerator JoinRoom(string code)
+    {
+        if (code.Length != 6) { netError = "6文字のコードを入れてください"; yield break; }
+        netError = "通信中…";
+        OnlineClient.GameView v = null;
+        yield return net.Join(code, x => v = x);
+        if (!string.IsNullOrEmpty(v.error)) { netError = NetErrorText(v.error); yield break; }
+        StartOnline(v);
+    }
+
+    void StartOnline(OnlineClient.GameView v)
+    {
+        Begin(Mode.Online, v.you == "white" ? 1 : -1);
+        onlinePanel = false; netError = ""; netResult = "";
+        netGame = v.id; netCode = v.code; netVersion = v.version; netApplied = 0; netJoined = v.opponent_joined;
+        nextPoll = 0;
+    }
+
+    // this player's move goes to the server first; the board plays it only once the server has accepted it
+    void Commit(Move m)
+    {
+        if (mode != Mode.Online) { StartCoroutine(PlayMove(m)); return; }
+        StartCoroutine(SendMove(m));
+    }
+
+    IEnumerator SendMove(Move m)
+    {
+        netSending = true; promoChoices = null; selected = -1; selMoves.Clear(); RefreshMarks();
+        OnlineClient.GameView v = null;
+        yield return net.Move(netGame, m.ToString(), netVersion, x => v = x);
+        if (!string.IsNullOrEmpty(v.error))
+        {
+            netError = NetErrorText(v.error);
+            netSending = false; nextPoll = 0;   // re-read the game from the server
+            yield break;
+        }
+        netError = ""; netVersion = v.version; netApplied++;
+        netSending = false;
+        yield return PlayMove(m);
+        ApplyServerStatus(v);
+    }
+
+    IEnumerator SendResign()
+    {
+        netSending = true;
+        OnlineClient.GameView v = null;
+        yield return net.Resign(netGame, x => v = x);
+        netSending = false;
+        if (!string.IsNullOrEmpty(v.error)) { netError = NetErrorText(v.error); yield break; }
+        netVersion = v.version; ApplyServerStatus(v);
+    }
+
+    void OnlinePoll()
+    {
+        if (net == null || string.IsNullOrEmpty(netGame) || busy || netSending || netFetching || Time.time < nextPoll) return;
+        nextPoll = Time.time + 1.5f;
+        StartCoroutine(Poll());
+    }
+
+    IEnumerator Poll()
+    {
+        netFetching = true;
+        OnlineClient.GameView v = null;
+        yield return net.Fetch(netGame, x => v = x);
+        netFetching = false;
+        if (!string.IsNullOrEmpty(v.error)) { netError = NetErrorText(v.error); yield break; }
+        if (netError == NetErrorText("network")) netError = "";
+        netJoined = v.opponent_joined;
+        if (busy || netSending) yield break;
+        if (v.moves.Length > netApplied)
+        {
+            var m = rules.Legal().Find(x => x.ToString() == v.moves[netApplied]);
+            if (m.from == m.to) { Resync(v); yield break; }   // not playable here: rebuild from the server's list
+            netApplied++;
+            if (netApplied == v.moves.Length) netVersion = v.version;
+            nextPoll = 0;   // pick up the next one straight away if there is one
+            yield return PlayMove(m);
+            if (netApplied == v.moves.Length) ApplyServerStatus(v);
+            yield break;
+        }
+        if (v.moves.Length < netApplied) { Resync(v); yield break; }
+        netVersion = v.version;
+        ApplyServerStatus(v);
+    }
+
+    // the board disagrees with the server: lay the server's game out again without animation
+    void Resync(OnlineClient.GameView v)
+    {
+        NewGame();
+        foreach (var t in v.moves)
+        {
+            var m = rules.Legal().Find(x => x.ToString() == t);
+            if (m.from == m.to) break;
+            rules.Make(m);
+        }
+        foreach (var p in live) if (p) Destroy(p.gameObject);
+        live.Clear(); System.Array.Clear(at, 0, 64);
+        if (fx) fx.ClearTrails();
+        for (int s = 0; s < 64; s++) if (rules.b[s] != 0) at[s] = Spawn(rules.b[s], s);
+        netApplied = v.moves.Length; netVersion = v.version;
+        result = rules.Status();
+        RefreshMarks();
+        ApplyServerStatus(v);
+    }
+
+    void ApplyServerStatus(OnlineClient.GameView v)
+    {
+        if (v.status == "playing" || v.status == "waiting" || result != ChessRules.Result.Playing) return;
+        if (v.reason == "resignation")
+            netResult = (v.status == "white_won" ? "黒が投了 — 白の勝ち" : "白が投了 — 黒の勝ち");
+        else if (v.status == "abandoned") netResult = "この対局は終了しました";
+    }
+
     string ResultText()
     {
+        if (!string.IsNullOrEmpty(netResult)) return netResult;
         switch (result)
         {
             case ChessRules.Result.WhiteMates: return "チェックメイト — 白の勝ち";
