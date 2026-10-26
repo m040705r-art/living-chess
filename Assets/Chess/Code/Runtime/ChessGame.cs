@@ -49,10 +49,18 @@ public class ChessGame : MonoBehaviour
     void Start()
     {
         mpb = new MaterialPropertyBlock();
-        if (Application.isMobilePlatform)   // phones (also a WebGL build opened on a phone): keep 60 fps
+        Input.simulateMouseWithTouches = true;   // a tap must reach IMGUI as a mouse click (mobile WebGL)
+        // On a WebGL build opened on a phone, Application.isMobilePlatform is false, so detect the phone by
+        // device type / touch instead and then trim the GPU cost (a colosseum full of statues is heavy on an
+        // iGPU/mobile GPU) and pull the camera in, since the board sat too far away on a tall screen.
+        bool phone = Application.isMobilePlatform || SystemInfo.deviceType == DeviceType.Handheld || (Input.touchSupported && Screen.width < Screen.height);
+        if (phone)
         {
-            QualitySettings.antiAliasing = 0; QualitySettings.shadowCascades = 1;
-            QualitySettings.shadowResolution = ShadowResolution.Low; QualitySettings.shadowDistance = 20;
+            QualitySettings.antiAliasing = 0;
+            QualitySettings.shadows = ShadowQuality.Disable;   // biggest single GPU saving on mobile
+            QualitySettings.shadowDistance = 0;
+            QualitySettings.pixelLightCount = 1;
+            zoom = 0.6f;   // lower zoom = closer; the board fills a phone screen instead of sitting far back
         }
         Application.targetFrameRate = 60;
         var mat = new Material(Shader.Find("Sprites/Default"));
@@ -96,6 +104,11 @@ public class ChessGame : MonoBehaviour
         go.name = (side == 1 ? "White " : "Black ") + t.name.Split(' ')[1] + " " + ChessRules.Sq(s);
         go.SetActive(true);
         var p = go.GetComponent<ChessPiece>();
+        // a tap target on the piece itself, so tapping the (tall) model selects the piece rather than the
+        // board square behind it. Kinematic body + trigger capsule: cheap to move with the animation, hit by raycasts.
+        var rb = go.AddComponent<Rigidbody>(); rb.isKinematic = true; rb.useGravity = false;
+        var col = go.AddComponent<CapsuleCollider>(); col.isTrigger = true;
+        col.center = new Vector3(0, 0.75f, 0); col.height = 1.7f; col.radius = 0.4f;
         live.Add(p);
         if (fx)
         {
@@ -145,20 +158,43 @@ public class ChessGame : MonoBehaviour
     void Click()
     {
         var cam = Camera.main;
+        if (cam == null) return;
         var ray = cam.ScreenPointToRay(Input.mousePosition);
-        if (Mathf.Abs(ray.direction.y) < 1e-4f) return;
-        float k = -ray.origin.y / ray.direction.y;
-        if (k < 0) return;
-        var p = ray.origin + ray.direction * k;
-        int f = Mathf.RoundToInt(p.x + 3), r = Mathf.RoundToInt(p.z + 3);
-        if (f < 0 || f > 7 || r < 0 || r > 7) { Select(-1); return; }
-        int s = r * 8 + f;
-        if (rules.b[s] * rules.side > 0) { Select(s); return; }
+
+        // 1) tapped a piece model? pick the nearest piece the ray passes through (reliable for tall pieces)
+        int s = -1;
+        float best = float.MaxValue;
+        foreach (var h in Physics.RaycastAll(ray, 200f))
+        {
+            var cp = h.collider.GetComponentInParent<ChessPiece>();
+            if (cp == null || h.distance >= best) continue;
+            int sq = SquareOf(cp);
+            if (sq >= 0) { best = h.distance; s = sq; }
+        }
+        // 2) otherwise the empty board square under the tap (to move onto a highlighted square)
+        if (s < 0)
+        {
+            if (Mathf.Abs(ray.direction.y) < 1e-4f) return;
+            float k = -ray.origin.y / ray.direction.y;
+            if (k < 0) return;
+            var p = ray.origin + ray.direction * k;
+            int f = Mathf.RoundToInt(p.x + 3), r = Mathf.RoundToInt(p.z + 3);
+            if (f < 0 || f > 7 || r < 0 || r > 7) { Select(-1); return; }
+            s = r * 8 + f;
+        }
+
+        if (rules.b[s] * rules.side > 0) { Select(s); return; }   // tapped own piece -> select & show its moves
         if (selected < 0) return;
         var options = selMoves.FindAll(m => m.to == s);
         if (options.Count == 0) { Select(-1); return; }
         if (options.Count > 1) { promoChoices = options; return; }   // a promotion: the player picks the piece
         Commit(options[0]);
+    }
+
+    int SquareOf(ChessPiece cp)
+    {
+        for (int i = 0; i < 64; i++) if (at[i] == cp) return i;
+        return -1;
     }
 
     void Select(int s)
@@ -408,9 +444,9 @@ public class ChessGame : MonoBehaviour
     }
 
     // ---------------------------------------------------------------- marks
-    static readonly Color CSelect = new Color(1f, 0.85f, 0.3f, 0.55f), CMove = new Color(0.35f, 0.95f, 0.5f, 0.42f),
-                          CTake = new Color(1f, 0.3f, 0.25f, 0.55f), CLast = new Color(0.95f, 0.8f, 0.4f, 0.22f),
-                          CCheck = new Color(1f, 0.1f, 0.05f, 0.6f);
+    static readonly Color CSelect = new Color(1f, 0.85f, 0.3f, 0.70f), CMove = new Color(0.35f, 1f, 0.5f, 0.60f),
+                          CTake = new Color(1f, 0.3f, 0.25f, 0.70f), CLast = new Color(0.95f, 0.8f, 0.4f, 0.28f),
+                          CCheck = new Color(1f, 0.1f, 0.05f, 0.7f);
 
     void Mark(int s, Color c)
     {
@@ -441,13 +477,13 @@ public class ChessGame : MonoBehaviour
         else if (mode == Mode.Online) target = humanSide == 1 ? 0 : 180;
         else target = rules.side == 1 ? 0 : 180;   // two players: the board turns to whoever is to move
         if (Input.GetMouseButton(1)) yawOffset += Input.GetAxis("Mouse X") * 4f;
-        zoom = Mathf.Clamp(zoom - Input.mouseScrollDelta.y * 0.06f, 0.55f, 1.4f);
+        zoom = Mathf.Clamp(zoom - Input.mouseScrollDelta.y * 0.06f, 0.45f, 1.4f);
         if (Input.touchCount == 2)   // two fingers: slide sideways to turn, pinch to zoom
         {
             Touch a = Input.GetTouch(0), b = Input.GetTouch(1);
             yawOffset += (a.deltaPosition.x + b.deltaPosition.x) * 0.5f * 180f / Mathf.Max(1, Screen.width);
             float now = (a.position - b.position).magnitude, before = ((a.position - a.deltaPosition) - (b.position - b.deltaPosition)).magnitude;
-            if (before > 1) zoom = Mathf.Clamp(zoom * before / Mathf.Max(1, now), 0.55f, 1.4f);
+            if (before > 1) zoom = Mathf.Clamp(zoom * before / Mathf.Max(1, now), 0.45f, 1.4f);
         }
         FitBoard();
         yaw = mode == Mode.Menu ? target : Mathf.LerpAngle(yaw, target + yawOffset, Time.deltaTime * 3f);
@@ -470,6 +506,7 @@ public class ChessGame : MonoBehaviour
     float VH => Screen.height / UiScale;
     Rect hud = new Rect(16, 16, 330, 190);
     GUIStyle big, mid, btn;
+    Font uiFont;   // Japanese-capable font (WebGL's built-in font has no CJK glyphs), loaded from Resources
 
     bool OverHud(Vector3 mouse)
     {
@@ -480,26 +517,37 @@ public class ChessGame : MonoBehaviour
     void Styles()
     {
         if (big != null) return;
+        if (uiFont == null) uiFont = Resources.Load<Font>("UiFontJP");   // M PLUS 1p (OFL); covers all UI kanji/kana
         big = new GUIStyle(GUI.skin.label) { fontSize = 34, fontStyle = FontStyle.Bold, alignment = TextAnchor.MiddleCenter };
         big.normal.textColor = new Color(1f, 0.86f, 0.55f);
         mid = new GUIStyle(GUI.skin.label) { fontSize = 20, wordWrap = true };
         mid.normal.textColor = Color.white;
         btn = new GUIStyle(GUI.skin.button) { fontSize = 20, fixedHeight = 40 };
+        if (uiFont != null) { big.font = uiFont; mid.font = uiFont; btn.font = uiFont; }
     }
 
     void OnGUI()
     {
         Styles();
+        // the built-in skin font lacks Japanese glyphs on WebGL; make every GUI control use the loaded JP font
+        if (uiFont != null) GUI.skin.font = uiFont;
         GUI.matrix = Matrix4x4.Scale(new Vector3(UiScale, UiScale, 1));
         if (mode == Mode.Menu)
         {
-            var r = new Rect(VW / 2f - 220, VH / 2f - (onlinePanel ? 330 : 230), 440, 460);
+            // the main box is sized to its content (no trailing blank space); the online section is a
+            // separate, tight box right below it, so pressing "オンライン対戦" just reveals an independent panel.
+            const float menuH = 356f, panelH = 214f, gap = 10f;
+            float totalH = onlinePanel ? menuH + gap + panelH : menuH;
+            var r = new Rect(VW / 2f - 220, VH / 2f - totalH / 2f, 440, menuH);
             GUI.Box(r, "");
             GUILayout.BeginArea(new Rect(r.x + 20, r.y + 16, r.width - 40, r.height - 32));
-            GUILayout.Label("Living Chess", big);
+            // explicit heights: with a dynamic CJK font, text measurement can differ between the Layout and
+            // Repaint passes (glyph atlas rebuilds), which would shift every control below and make the buttons'
+            // hit area miss their drawn position. Pinning heights keeps the layout identical in both passes.
+            GUILayout.Label("Living Chess", big, GUILayout.Height(46));
             GUILayout.Space(10);
-            GUILayout.Label("CPU の強さ", mid);
-            level = GUILayout.Toolbar(level, LevelNames, btn);
+            GUILayout.Label("CPU の強さ", mid, GUILayout.Height(26));
+            level = GUILayout.Toolbar(level, LevelNames, btn, GUILayout.Height(40));
             GUILayout.Space(12);
             if (GUILayout.Button("CPU と対戦（白で指す）", btn)) Begin(Mode.VsCpu, 1);
             if (GUILayout.Button("CPU と対戦（黒で指す）", btn)) Begin(Mode.VsCpu, -1);
@@ -507,7 +555,7 @@ public class ChessGame : MonoBehaviour
             GUILayout.Space(8);
             if (GUILayout.Button("オンライン対戦", btn)) { onlinePanel = !onlinePanel; netError = ""; }
             GUILayout.EndArea();
-            if (onlinePanel) OnlinePanel(new Rect(r.x, r.yMax + 10, r.width, 230));
+            if (onlinePanel) OnlinePanel(new Rect(r.x, r.yMax + gap, r.width, panelH));
             return;
         }
         GUI.Box(hud, "");
@@ -529,7 +577,7 @@ public class ChessGame : MonoBehaviour
             var r = new Rect(VW / 2f - 230, VH - 140, 460, 110);
             GUI.Box(r, "");
             GUILayout.BeginArea(new Rect(r.x + 12, r.y + 10, r.width - 24, r.height - 20));
-            GUILayout.Label("昇格する駒を選んでください", mid);
+            GUILayout.Label("昇格する駒を選んでください", mid, GUILayout.Height(26));
             GUILayout.BeginHorizontal();
             foreach (var (name, t) in new[] { ("クイーン", ChessRules.Queen), ("ルーク", ChessRules.Rook), ("ビショップ", ChessRules.Bishop), ("ナイト", ChessRules.Knight) })
                 if (GUILayout.Button(name, btn)) { var m = promoChoices.Find(x => Mathf.Abs(x.promo) == t); Commit(m); }
@@ -589,20 +637,20 @@ public class ChessGame : MonoBehaviour
         GUI.Box(r, "");
         GUILayout.BeginArea(new Rect(r.x + 20, r.y + 12, r.width - 40, r.height - 24));
         if (net == null) net = new OnlineClient();
-        if (!net.Ready) { GUILayout.Label("オンライン対戦の接続先が設定されていません", mid); GUILayout.EndArea(); return; }
-        GUILayout.Label("部屋を作る（色を選ぶ）", mid);
+        if (!net.Ready) { GUILayout.Label("オンライン対戦の接続先が設定されていません", mid, GUILayout.Height(52)); GUILayout.EndArea(); return; }
+        GUILayout.Label("部屋を作る（色を選ぶ）", mid, GUILayout.Height(26));
         GUILayout.BeginHorizontal();
         if (GUILayout.Button("白", btn)) StartCoroutine(CreateRoom("white"));
         if (GUILayout.Button("黒", btn)) StartCoroutine(CreateRoom("black"));
         if (GUILayout.Button("おまかせ", btn)) StartCoroutine(CreateRoom("random"));
         GUILayout.EndHorizontal();
-        GUILayout.Label("ルームコードで参加", mid);
+        GUILayout.Label("ルームコードで参加", mid, GUILayout.Height(26));
         GUILayout.BeginHorizontal();
-        var field = new GUIStyle(GUI.skin.textField) { fontSize = 22, fixedHeight = 40 };
+        var field = new GUIStyle(GUI.skin.textField) { fontSize = 22, fixedHeight = 40, font = uiFont };
         codeInput = GUILayout.TextField(codeInput, 6, field, GUILayout.Width(170)).ToUpperInvariant();
         if (GUILayout.Button("参加", btn)) StartCoroutine(JoinRoom(codeInput.Trim()));
         GUILayout.EndHorizontal();
-        if (!string.IsNullOrEmpty(netError)) GUILayout.Label(netError, mid);
+        if (!string.IsNullOrEmpty(netError)) GUILayout.Label(netError, mid, GUILayout.Height(26));
         GUILayout.EndArea();
     }
 
