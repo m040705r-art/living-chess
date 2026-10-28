@@ -18,3 +18,6 @@
 | `BlenderSource` | 駒・アニメーション・舞台を Blender のスクリプトで生成（`export.py`, `arena.py`） |
 | `SoundSource` | 効果音の合成スクリプト（今は無効） |
 | `WebPreview` | three.js のモーション確認ページ |
+
+<img width="1466" height="1016" alt="スクリーンショット 2026-10-28 164222" src="https://github.com/user-attachments/assets/73981a45-9fc3-4c4a-9583-2cfba4f54812" />
+<img width="1511" height="1006" alt="スクリーンショット 2026-10-28 164237" src="https://github.com/user-attachments/assets/7b6e28a5-b67e-471d-b7a1-4b3e69fb57c3" />
